@@ -36,7 +36,7 @@ def handle_message(event):
     msg_id = event.message.id
     text = event.message.text.strip()
     
-    # 存訊息 (防收回功能)
+    # 存訊息
     message_store[msg_id] = text
 
     reply_text = None
@@ -46,7 +46,7 @@ def handle_message(event):
         points = random.randint(1, 6)
         reply_text = f"🎲 擲出了：{points} 點"
 
-    # --- 功能 B: 金價 (防擋版) ---
+    # --- 功能 B: 金價 (換算1錢) ---
     elif text == '!金價':
         try:
             url = "https://rate.bot.com.tw/gold?Lang=zh-TW"
@@ -59,16 +59,26 @@ def handle_message(event):
                     target_row = row
                     break
             
+            # 取得公克價格字串 (例如 "2,850")
+            price_str = "0"
             if target_row:
-                price = target_row.select_one("td.text-right").text.strip()
-                reply_text = f"💰 台灣銀行今日金價 (黃金存摺)：\n1公克賣出價：NT$ {price}\n(資料來源：台灣銀行)"
+                price_str = target_row.select_one("td.text-right").text.strip()
             else:
-                price = soup.select_one("td.text-right").text.strip()
-                reply_text = f"💰 台灣銀行今日金價：\n1公克賣出價：NT$ {price}\n(備用來源)"
-        except:
+                price_str = soup.select_one("td.text-right").text.strip()
+
+            # 進行換算
+            # 1. 移除逗號轉成數字
+            price_per_gram = float(price_str.replace(',', ''))
+            # 2. 換算成錢 (1錢 = 3.75克)
+            price_per_mace = int(price_per_gram * 3.75)
+
+            reply_text = f"💰 台灣銀行今日金價 (黃金存摺)：\n👉 1錢賣出價：NT$ {price_per_mace:,}\n(原始克價：{price_str})"
+
+        except Exception as e:
+            print(e)
             reply_text = "⚠️ 抓取金價失敗，請稍後再試。"
 
-    # --- 功能 C: 匯率 (防擋版) ---
+    # --- 功能 C: 匯率 ---
     elif text == '!匯率':
         try:
             url = "https://rate.bot.com.tw/xrt?Lang=zh-TW"
@@ -88,14 +98,11 @@ def handle_message(event):
         except:
             reply_text = "⚠️ 抓取匯率失敗。"
 
-    # --- 功能 D: 天氣 (支援多地區) ---
+    # --- 功能 D: 天氣 (預設平鎮) ---
     elif text.startswith('!天氣'):
-        # 1. 設定預設地點：平鎮
         lat, lon = 24.9442, 121.2192
         location = "桃園平鎮"
 
-        # 2. 判斷是否有指定其他地點
-        # 為了避免「桃園平鎮」被誤判為「桃園區」，我們先判斷較精準的地區
         if "中壢" in text:
             lat, lon = 24.9653, 121.2255
             location = "桃園中壢"
@@ -105,6 +112,9 @@ def handle_message(event):
         elif "桃園" in text:
             lat, lon = 24.9936, 121.3010
             location = "桃園區"
+        elif "台北" in text:
+            lat, lon = 25.0330, 121.5654
+            location = "台北"
         elif "台中" in text:
             lat, lon = 24.1477, 120.6736
             location = "台中"
@@ -114,7 +124,6 @@ def handle_message(event):
         elif "名古屋" in text:
             lat, lon = 35.1815, 136.9066
             location = "日本名古屋"
-        # 如果都沒提到，就會維持上面的預設值 (平鎮)
 
         try:
             api_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=auto"
