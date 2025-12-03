@@ -40,11 +40,10 @@ def get_room_data(source_id):
         rooms_data[source_id] = {
             'debt': [], 
             'deck': new_deck,
-            'unsent_buffer': [] # 新增一個暫存區，專門放「忍住沒說」的收回訊息
+            'unsent_buffer': [] 
         }
     return rooms_data[source_id]
 
-# 定期清理
 def cleanup_images():
     while True:
         try:
@@ -95,46 +94,41 @@ def handle_text_message(event):
     source_id = event.source.group_id if event.source.type == 'group' else event.source.user_id
     
     room = get_room_data(source_id)
-    message_store[msg_id] = text # 存起來備查
+    message_store[msg_id] = text
     reply_messages = []
 
     # --- 功能 X: 抓收回 (!抓) ---
-    # 這是原本要錢的功能，現在改成你問它才答，就變免費了
     if text == '!抓':
         if not room.get('unsent_buffer'):
             reply_messages.append(TextSendMessage(text="👻 目前沒有人收回訊息喔！"))
         else:
-            # 把暫存區所有的收回訊息吐出來
             for item in room['unsent_buffer']:
                 sender = item['sender']
                 msg_type = item['type']
                 content = item['content']
-                
                 if msg_type == 'text':
                     reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！剛剛「{sender}」收回了：\n{content}"))
                 elif msg_type == 'image':
                     img_url = content
                     reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！「{sender}」剛剛收回這張圖 👇"))
                     reply_messages.append(ImageSendMessage(original_content_url=img_url, preview_image_url=img_url))
-            
-            # 吐完之後清空，避免下次重複顯示
             room['unsent_buffer'] = []
 
     # --- 功能 0: 指令表 ---
     elif text == '!指令':
         reply_text = (
-            "🤖 機器人指令表 (免費無限版)：\n"
+            "🤖 機器人指令表：\n"
             "-----------------\n"
-            "🕵️ 防收回 (省錢模式)\n"
-            "👉 !抓 : 顯示剛剛被收回的訊息\n"
-            "   (看到「xxx收回訊息」時請打這個)\n\n"
-            "💰 記帳小幫手\n"
+            "🕵️ 防收回 (省錢版)\n"
+            "👉 !抓 : 顯示剛剛被收回的訊息\n\n"
+            "💰 記帳\n"
             "👉 !記 @A 欠 @B 100 [備註]\n"
             "👉 !還 @A 還 @B 100\n"
             "👉 !查帳 / !一筆勾銷\n\n"
-            "🎮 娛樂區\n"
-            "👉 !推 / !洗牌 / !骰子\n\n"
-            "🛠 工具區\n"
+            "🎮 娛樂\n"
+            "👉 !推 : 這裡會顯示你的名字\n"
+            "👉 !洗牌 / !骰子\n\n"
+            "🛠 工具\n"
             "👉 !金價 / !匯率 / !天氣\n"
             "-----------------"
         )
@@ -181,7 +175,7 @@ def handle_text_message(event):
         room['debt'].clear()
         reply_messages.append(TextSendMessage(text="🧹 [本群] 帳本已清空！"))
 
-    # --- 娛樂 ---
+    # --- 娛樂 (推筒子 - 顯示名字) ---
     elif text == '!推':
         deck = room['deck']
         if len(deck) < 2:
@@ -190,9 +184,23 @@ def handle_text_message(event):
             room['deck'] = new_deck
             deck = room['deck']
             reply_messages.append(TextSendMessage(text="✅ 洗牌完成！"))
+        
+        # 🔥 這裡就是抓取名字的關鍵邏輯
+        user_name = "玩家"
+        try:
+            if event.source.type == 'group':
+                profile = line_bot_api.get_group_member_profile(event.source.group_id, user_id)
+                user_name = profile.display_name
+            else:
+                profile = line_bot_api.get_profile(user_id)
+                user_name = profile.display_name
+        except: 
+            pass
+
         t1 = deck.pop(); t2 = deck.pop()
         score_desc = calculate_score(t1, t2)
-        reply_messages.append(TextSendMessage(text=f"🀄 結果：{score_desc}\n(剩 {len(deck)} 張)"))
+        # 回覆時帶上名字
+        reply_messages.append(TextSendMessage(text=f"👤 {user_name} 的牌：\n🀄 {get_tile_text(t1)} {get_tile_text(t2)}\n📊 結果：{score_desc}\n(剩 {len(deck)} 張)"))
 
     elif text == '!洗牌':
         new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
@@ -268,7 +276,6 @@ def handle_unsend(event):
     source_id = event.source.group_id if event.source.type == 'group' else event.source.user_id
     room = get_room_data(source_id)
     
-    # 抓名字
     sender_name = "有人"
     try:
         user_id = event.source.user_id
@@ -280,34 +287,18 @@ def handle_unsend(event):
             sender_name = profile.display_name
     except: pass
 
-    # 檢查是文字還是圖片，存入暫存區 (unsent_buffer)
     img_path = os.path.join(static_tmp_path, f"{uid}.jpg")
     
-    # 初始化 buffer (防呆)
     if 'unsent_buffer' not in room:
         room['unsent_buffer'] = []
 
     if os.path.exists(img_path):
-        # 是圖片，存圖片網址
         url = f"{FQDN}/static/tmp/{uid}.jpg"
-        room['unsent_buffer'].append({
-            'sender': sender_name,
-            'type': 'image',
-            'content': url
-        })
-        print(f"[DEBUG] 圖片收回已暫存，等待指令觸發。")
+        room['unsent_buffer'].append({'sender': sender_name, 'type': 'image', 'content': url})
 
     elif uid in message_store:
-        # 是文字，存文字內容
         msg = message_store[uid]
-        room['unsent_buffer'].append({
-            'sender': sender_name,
-            'type': 'text',
-            'content': msg
-        })
-        print(f"[DEBUG] 文字收回已暫存: {msg}")
-
-    # 注意！這裡我們「故意」不呼叫 push_message，所以完全不會扣錢！
+        room['unsent_buffer'].append({'sender': sender_name, 'type': 'text', 'content': msg})
 
 if __name__ == "__main__":
     app.run()
