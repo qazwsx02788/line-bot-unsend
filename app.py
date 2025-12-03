@@ -4,7 +4,7 @@ import requests
 import threading
 import time
 from bs4 import BeautifulSoup
-from flask import Flask, request, abort, send_from_directory
+from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
@@ -15,8 +15,7 @@ from linebot.models import (
 app = Flask(__name__)
 
 # ==========================================
-# 👇 請把這裡改成你的 Render 網址 (後面不要有 /)
-# 例如: "https://line-bot-unsend.onrender.com"
+# 👇 請改成你的 Render 網址 (後面不要有 /)
 FQDN = "https://line-bot-unsend.onrender.com"
 # ==========================================
 
@@ -31,21 +30,19 @@ message_store = {}
 static_tmp_path = os.path.join(os.path.dirname(__file__), 'static', 'tmp')
 os.makedirs(static_tmp_path, exist_ok=True)
 
-# 定期清理舊圖片 (避免硬碟爆掉) - 每 1 小時執行一次
+# 定期清理舊圖片
 def cleanup_images():
     while True:
         try:
             now = time.time()
             for f in os.listdir(static_tmp_path):
                 f_path = os.path.join(static_tmp_path, f)
-                # 如果檔案超過 1 小時就刪除
                 if os.stat(f_path).st_mtime < now - 3600:
                     os.remove(f_path)
         except:
             pass
         time.sleep(3600)
 
-# 啟動清理執行緒
 threading.Thread(target=cleanup_images, daemon=True).start()
 
 # 首頁
@@ -80,8 +77,25 @@ def handle_text_message(event):
 
     reply_text = None
 
-    # --- 功能 E: 多人推筒子 (輸入 !推) ---
-    if text == '!推':
+    # --- 功能 0: 指令表 ---
+    if text == '!指令':
+        reply_text = (
+            "🤖 機器人指令表：\n"
+            "-----------------\n"
+            "🎮 娛樂區\n"
+            "👉 !推 : 玩推筒子\n"
+            "👉 !骰子 : 擲骰子\n\n"
+            "🛠 工具區\n"
+            "👉 !金價 : 查今日飾金賣出價\n"
+            "👉 !匯率 : 查日幣匯率\n"
+            "👉 !天氣 : 查平鎮氣溫\n"
+            "👉 !天氣 [地名] : 查全球氣溫\n"
+            "   (例: !天氣 東京、!天氣 紐約)\n"
+            "-----------------"
+        )
+
+    # --- 功能 E: 多人推筒子 ---
+    elif text == '!推':
         user_name = "玩家"
         try:
             if event.source.type == 'group':
@@ -153,69 +167,73 @@ def handle_text_message(event):
         except:
             reply_text = "⚠️ 抓取匯率失敗。"
 
-    # --- 功能 D: 天氣 ---
+    # --- 功能 D: 全球天氣 (新功能) ---
     elif text.startswith('!天氣'):
-        lat, lon = 24.9442, 121.2192
-        location = "桃園平鎮"
-        if "中壢" in text: lat, lon, location = 24.9653, 121.2255, "桃園中壢"
-        elif "楊梅" in text: lat, lon, location = 24.9084, 121.1456, "桃園楊梅"
-        elif "桃園" in text: lat, lon, location = 24.9936, 121.3010, "桃園區"
-        elif "台北" in text: lat, lon, location = 25.0330, 121.5654, "台北"
-        elif "台中" in text: lat, lon, location = 24.1477, 120.6736, "台中"
-        elif "高雄" in text: lat, lon, location = 22.6273, 120.3014, "高雄"
-        elif "名古屋" in text: lat, lon, location = 35.1815, 136.9066, "日本名古屋"
+        # 1. 取得使用者輸入的地點
+        query_location = text.replace('!天氣', '').strip()
+        
+        lat, lon, location_name = None, None, None
 
-        try:
-            api = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=auto"
-            res = requests.get(api, headers=headers).json()
-            reply_text = f"🌤 {location} 目前氣溫：{res['current_weather']['temperature']}°C"
-        except:
-            reply_text = "⚠️ 氣象資料失敗。"
+        if not query_location:
+            # 如果沒輸入地點，預設平鎮
+            lat, lon, location_name = 24.9442, 121.2192, "桃園平鎮"
+        else:
+            # 如果有輸入，使用 Geocoding API 搜尋座標
+            try:
+                geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={query_location}&count=1&language=zh&format=json"
+                geo_res = requests.get(geo_url, headers=headers).json()
+                
+                if "results" in geo_res and len(geo_res["results"]) > 0:
+                    result = geo_res["results"][0]
+                    lat = result["latitude"]
+                    lon = result["longitude"]
+                    location_name = result["name"] # 抓取 API 回傳的正式名稱
+                else:
+                    reply_text = f"⚠️ 找不到「{query_location}」這個地方喔！"
+            except:
+                reply_text = "⚠️ 地點搜尋發生錯誤。"
+
+        # 如果成功取得了座標，就去查天氣
+        if lat and lon:
+            try:
+                api = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=auto"
+                res = requests.get(api, headers=headers).json()
+                temp = res['current_weather']['temperature']
+                reply_text = f"🌤 {location_name} 目前氣溫：{temp}°C"
+            except:
+                reply_text = "⚠️ 氣象資料讀取失敗。"
 
     if reply_text:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
-# --- 處理圖片訊息 (儲存圖片) ---
+# --- 處理圖片訊息 ---
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
     msg_id = event.message.id
-    # 下載圖片內容
     message_content = line_bot_api.get_message_content(msg_id)
-    # 存檔路徑
     file_path = os.path.join(static_tmp_path, f"{msg_id}.jpg")
-    
     with open(file_path, 'wb') as fd:
         for chunk in message_content.iter_content():
             fd.write(chunk)
 
-# --- 處理收回事件 (文字+圖片) ---
+# --- 處理收回事件 ---
 @handler.add(UnsendEvent)
 def handle_unsend(event):
     unsent_id = event.unsend.message_id
-    
-    # 1. 檢查是不是圖片收回
     img_path = os.path.join(static_tmp_path, f"{unsent_id}.jpg")
     
     if os.path.exists(img_path):
-        # 圖片存在，發送圖片
         img_url = f"{FQDN}/static/tmp/{unsent_id}.jpg"
         msg = ImageSendMessage(original_content_url=img_url, preview_image_url=img_url)
         reply_text = "抓到了！有人收回圖片 (如下) 👇"
-        
-        # 先傳提示文字，再傳圖片
-        if event.source.type == 'group':
-            line_bot_api.push_message(event.source.group_id, [TextSendMessage(text=reply_text), msg])
-        elif event.source.type == 'user':
-            line_bot_api.push_message(event.source.user_id, [TextSendMessage(text=reply_text), msg])
+        target_id = event.source.group_id if event.source.type == 'group' else event.source.user_id
+        line_bot_api.push_message(target_id, [TextSendMessage(text=reply_text), msg])
             
-    # 2. 檢查是不是文字收回
     elif unsent_id in message_store:
         msg = message_store[unsent_id]
         reply = f"抓到了！有人收回訊息：\n{msg}"
-        if event.source.type == 'group':
-            line_bot_api.push_message(event.source.group_id, TextSendMessage(text=reply))
-        elif event.source.type == 'user':
-            line_bot_api.push_message(event.source.user_id, TextSendMessage(text=reply))
+        target_id = event.source.group_id if event.source.type == 'group' else event.source.user_id
+        line_bot_api.push_message(target_id, TextSendMessage(text=reply))
 
 if __name__ == "__main__":
     app.run()
