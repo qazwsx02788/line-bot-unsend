@@ -29,16 +29,22 @@ message_store = {}
 static_tmp_path = os.path.join(os.path.dirname(__file__), 'static', 'tmp')
 os.makedirs(static_tmp_path, exist_ok=True)
 
-# --- 記帳資料 (記憶體暫存，重啟會消失) ---
-debt_records = []
+# --- 核心資料結構 (以 ID 區分群組) ---
+# 格式: { 'GROUP_ID': { 'debt': [], 'deck': [] } }
+rooms_data = {}
 
-# --- 真實牌堆 ---
-current_deck = []
-def shuffle_deck():
-    global current_deck
-    current_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
-    random.shuffle(current_deck)
-shuffle_deck()
+# 取得或初始化該群組的資料
+def get_room_data(source_id):
+    if source_id not in rooms_data:
+        # 初始化新的一副牌
+        new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
+        random.shuffle(new_deck)
+        
+        rooms_data[source_id] = {
+            'debt': [],       # 記帳本
+            'deck': new_deck  # 牌堆
+        }
+    return rooms_data[source_id]
 
 # 定期清理舊圖片
 def cleanup_images():
@@ -86,20 +92,26 @@ def handle_text_message(event):
     msg_id = event.message.id
     text = event.message.text.strip()
     user_id = event.source.user_id
+    
+    # 判斷來源 ID (群組ID 或 個人ID)
+    source_id = event.source.group_id if event.source.type == 'group' else event.source.user_id
+    
+    # 取得該房間的專屬資料
+    room = get_room_data(source_id)
+
     message_store[msg_id] = text
     reply_messages = []
 
     # --- 功能 0: 指令表 ---
     if text == '!指令':
         reply_text = (
-            "🤖 機器人指令表：\n"
+            "🤖 機器人指令表 (本群組獨立)：\n"
             "-----------------\n"
-            "💰 短期記帳 (重啟會清空)\n"
+            "💰 記帳小幫手\n"
             "👉 !記 @A 欠 @B 100 [備註]\n"
             "👉 !還 @A 還 @B 100\n"
-            "👉 !查帳 : 列出欠款總結\n"
-            "👉 !一筆勾銷 : 清空帳本\n\n"
-            "🎮 娛樂區\n"
+            "👉 !查帳 / !一筆勾銷\n\n"
+            "🎮 娛樂區 (獨立牌堆)\n"
             "👉 !推 / !洗牌 / !骰子\n\n"
             "🛠 工具區\n"
             "👉 !金價 / !匯率 / !天氣\n"
@@ -107,7 +119,7 @@ def handle_text_message(event):
         )
         reply_messages.append(TextSendMessage(text=reply_text))
 
-    # --- 記帳功能 ---
+    # --- 記帳功能 (存入 room['debt']) ---
     elif text.startswith('!記 '):
         try:
             parts = text.split()
@@ -115,8 +127,10 @@ def handle_text_message(event):
                 idx = parts.index('欠')
                 d, c, amt = parts[1], parts[idx+1], int(parts[idx+2])
                 note = " ".join(parts[idx+3:]) if len(parts) > idx+3 else "無備註"
-                debt_records.append({'d': d, 'c': c, 'amt': amt, 'note': note, 'time': datetime.now().strftime("%H:%M")})
-                reply_messages.append(TextSendMessage(text=f"📝 已記錄：\n{d} 欠 {c} ${amt}\n({note})"))
+                
+                room['debt'].append({'d': d, 'c': c, 'amt': amt, 'note': note, 'time': datetime.now().strftime("%H:%M")})
+                
+                reply_messages.append(TextSendMessage(text=f"📝 [本群] 已記錄：\n{d} 欠 {c} ${amt}\n({note})"))
             else: reply_messages.append(TextSendMessage(text="⚠️ 格式：!記 @A 欠 @B 100 備註"))
         except: reply_messages.append(TextSendMessage(text="⚠️ 格式錯誤或金額非數字。"))
 
@@ -125,22 +139,24 @@ def handle_text_message(event):
             parts = text.split()
             if '還' in parts and len(parts) >= 5:
                 d, c, amt = parts[1], parts[3], int(parts[4])
-                debt_records.append({'d': d, 'c': c, 'amt': -amt, 'note': '還款', 'time': datetime.now().strftime("%H:%M")})
-                reply_messages.append(TextSendMessage(text=f"💸 已扣除：\n{d} 還 {c} ${amt}"))
+                
+                room['debt'].append({'d': d, 'c': c, 'amt': -amt, 'note': '還款', 'time': datetime.now().strftime("%H:%M")})
+                
+                reply_messages.append(TextSendMessage(text=f"💸 [本群] 已扣除：\n{d} 還 {c} ${amt}"))
             else: reply_messages.append(TextSendMessage(text="⚠️ 格式：!還 @A 還 @B 100"))
         except: reply_messages.append(TextSendMessage(text="⚠️ 格式錯誤。"))
 
     elif text == '!查帳':
-        if not debt_records:
-            reply_messages.append(TextSendMessage(text="📭 目前沒有欠款紀錄！"))
+        if not room['debt']:
+            reply_messages.append(TextSendMessage(text="📭 [本群] 目前沒有欠款紀錄！"))
         else:
             summary = {}
-            for r in debt_records:
+            for r in room['debt']:
                 k = (r['d'], r['c'])
                 if k not in summary: summary[k] = 0
                 summary[k] += r['amt']
             
-            res = "📊 【欠款總結】\n"
+            res = "📊 【本群欠款總結】\n"
             has_debt = False
             for (d, c), total in summary.items():
                 if total > 0:
@@ -149,22 +165,26 @@ def handle_text_message(event):
             if not has_debt: res += "✅ 所有帳目已結清！\n"
             
             res += "\n🧾 【近期明細】\n"
-            for r in debt_records[-10:]: # 只顯示最後10筆避免洗版
+            for r in room['debt'][-10:]:
                 action = "欠" if r['amt'] > 0 else "還"
                 res += f"[{r['time']}] {r['d']} {action} {r['c']} ${abs(r['amt'])}\n"
             
             reply_messages.append(TextSendMessage(text=res))
 
     elif text == '!一筆勾銷':
-        debt_records.clear()
-        reply_messages.append(TextSendMessage(text="🧹 帳本已清空！"))
+        room['debt'].clear()
+        reply_messages.append(TextSendMessage(text="🧹 [本群] 帳本已清空！"))
 
-    # --- 娛樂功能 ---
+    # --- 娛樂功能 (使用 room['deck']) ---
     elif text == '!推':
-        global current_deck
-        if len(current_deck) < 2:
+        deck = room['deck'] # 取得該房間的牌堆
+        
+        if len(deck) < 2:
             reply_messages.append(TextSendMessage(text="🀄 牌底沒了！自動洗牌中..."))
-            shuffle_deck()
+            new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
+            random.shuffle(new_deck)
+            room['deck'] = new_deck
+            deck = room['deck'] # 更新參照
             reply_messages.append(TextSendMessage(text="✅ 洗牌完成！"))
         
         user_name = "玩家"
@@ -175,18 +195,20 @@ def handle_text_message(event):
                 user_name = line_bot_api.get_profile(user_id).display_name
         except: pass
 
-        t1 = current_deck.pop(); t2 = current_deck.pop()
+        t1 = deck.pop(); t2 = deck.pop()
         score_desc = calculate_score(t1, t2)
-        reply_messages.append(TextSendMessage(text=f"👤 {user_name} 的牌：\n🀄 {get_tile_text(t1)} {get_tile_text(t2)}\n📊 結果：{score_desc}\n(剩 {len(current_deck)} 張)"))
+        reply_messages.append(TextSendMessage(text=f"👤 {user_name} 的牌：\n🀄 {get_tile_text(t1)} {get_tile_text(t2)}\n📊 結果：{score_desc}\n(本群剩 {len(deck)} 張)"))
 
     elif text == '!洗牌':
-        shuffle_deck()
-        reply_messages.append(TextSendMessage(text="🔄 手動洗牌完成！"))
+        new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
+        random.shuffle(new_deck)
+        room['deck'] = new_deck
+        reply_messages.append(TextSendMessage(text="🔄 [本群] 手動洗牌完成！"))
 
     elif text == '!骰子':
         reply_messages.append(TextSendMessage(text=f"🎲 擲出了：{random.randint(1, 6)} 點"))
 
-    # --- 工具功能 ---
+    # --- 工具功能 (共用) ---
     elif text == '!金價':
         try:
             url = "https://999k.com.tw/"
