@@ -77,9 +77,14 @@ def callback():
         return 'OK'
     return 'OK'
 
-# --- 輔助函式 ---
+# --- 改良版：直接顯示文字，保證看得到 ---
 def get_tile_text(v):
-    return {1:"🀙",2:"🀚",3:"🀛",4:"🀜",5:"🀝",6:"🀞",7:"🀟",8:"🀠",9:"🀡",0.5:"🀆"}.get(v,"?")
+    tiles_map = {
+        1: "【一筒】", 2: "【二筒】", 3: "【三筒】", 4: "【四筒】", 5: "【五筒】",
+        6: "【六筒】", 7: "【七筒】", 8: "【八筒】", 9: "【九筒】", 0.5: "【白板】"
+    }
+    return tiles_map.get(v, "【?】")
+
 def calculate_score(t1, t2):
     if t1 == t2: return "👑 白板對子 (通殺!)" if t1==0.5 else f"🔥 豹子 {int(t1)}對"
     pts = (t1 + t2) % 10
@@ -169,13 +174,17 @@ def handle_text_message(event):
             for (d, c), total in summary.items():
                 if total > 0: has_debt = True; res += f"🔴 {d} 欠 {c}：${total}\n"
             if not has_debt: res += "✅ 所有帳目已結清！\n"
+            res += "\n🧾 【近期明細】\n"
+            for r in room['debt'][-10:]:
+                action = "欠" if r['amt'] > 0 else "還"
+                res += f"[{r['time']}] {r['d']} {action} {r['c']} ${abs(r['amt'])}\n"
             reply_messages.append(TextSendMessage(text=res))
 
     elif text == '!一筆勾銷':
         room['debt'].clear()
         reply_messages.append(TextSendMessage(text="🧹 [本群] 帳本已清空！"))
 
-    # --- 娛樂 (推筒子 - 顯示名字) ---
+    # --- 娛樂 (推筒子 - 文字版) ---
     elif text == '!推':
         deck = room['deck']
         if len(deck) < 2:
@@ -185,7 +194,6 @@ def handle_text_message(event):
             deck = room['deck']
             reply_messages.append(TextSendMessage(text="✅ 洗牌完成！"))
         
-        # 🔥 這裡就是抓取名字的關鍵邏輯
         user_name = "玩家"
         try:
             if event.source.type == 'group':
@@ -199,8 +207,8 @@ def handle_text_message(event):
 
         t1 = deck.pop(); t2 = deck.pop()
         score_desc = calculate_score(t1, t2)
-        # 回覆時帶上名字
-        reply_messages.append(TextSendMessage(text=f"👤 {user_name} 的牌：\n🀄 {get_tile_text(t1)} {get_tile_text(t2)}\n📊 結果：{score_desc}\n(剩 {len(deck)} 張)"))
+        # 回覆時帶上名字 + 純文字牌型
+        reply_messages.append(TextSendMessage(text=f"👤 {user_name} 的牌：\n{get_tile_text(t1)}  {get_tile_text(t2)}\n📊 結果：{score_desc}\n(剩 {len(deck)} 張)"))
 
     elif text == '!洗牌':
         new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
