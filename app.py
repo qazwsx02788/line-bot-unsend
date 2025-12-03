@@ -16,9 +16,16 @@ handler = WebhookHandler(os.environ.get('CHANNEL_SECRET'))
 # 暫存訊息
 message_store = {}
 
-# 偽裝成瀏覽器的 Header
+# 這是首頁，讓 UptimeRobot 敲門時看到綠燈
+@app.route("/")
+def home():
+    return "Robot is Alive!"
+
+# 偽裝成真人瀏覽器的身分證 (更完整的 Header)
 headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
 }
 
 @app.route("/callback", methods=['POST'])
@@ -46,49 +53,67 @@ def handle_message(event):
         points = random.randint(1, 6)
         reply_text = f"🎲 擲出了：{points} 點"
 
-    # --- 功能 B: 金價 (換算1錢) ---
+    # --- 功能 B: 金價 (強力抓取版) ---
     elif text == '!金價':
         try:
             url = "https://rate.bot.com.tw/gold?Lang=zh-TW"
-            res = requests.get(url, headers=headers)
-            soup = BeautifulSoup(res.text, "html.parser")
+            # 使用 requests.Session() 來模擬連續瀏覽
+            session = requests.Session()
+            res = session.get(url, headers=headers, timeout=10)
             
-            target_row = None
-            for row in soup.find_all('tr'):
-                if "本行賣出" in row.text and "黃金存摺" in row.text:
-                    target_row = row
-                    break
-            
-            # 取得公克價格字串 (例如 "2,850")
-            price_str = "0"
-            if target_row:
-                price_str = target_row.select_one("td.text-right").text.strip()
+            # 檢查連線狀態
+            if res.status_code != 200:
+                print(f"連線失敗，狀態碼：{res.status_code}")
+                reply_text = f"⚠️ 銀行拒絕連線 (錯誤碼 {res.status_code})，可能 IP 被擋。"
             else:
-                price_str = soup.select_one("td.text-right").text.strip()
+                soup = BeautifulSoup(res.text, "html.parser")
+                
+                # 嘗試抓取含有「本行賣出」的表格資料
+                price_str = None
+                
+                # 方法一：精準搜尋表格
+                for row in soup.find_all('tr'):
+                    # 找到含有 "黃金存摺" 且含有數字的欄位
+                    if "黃金存摺" in row.text:
+                        # 抓取該行的所有欄位 (td)
+                        tds = row.find_all('td')
+                        # 通常賣出價在第 3 格 (索引 2) 或尋找靠右對齊的數字
+                        for td in tds:
+                            if "text-right" in td.get('class', []) and td.text.strip().replace(',','').isdigit():
+                                price_str = td.text.strip()
+                                break
+                    if price_str: break
+                
+                # 方法二：如果上面失敗，暴力抓取第一個看到的價格
+                if not price_str:
+                     first_price = soup.select_one("td.text-right")
+                     if first_price:
+                         price_str = first_price.text.strip()
 
-            # 進行換算
-            # 1. 移除逗號轉成數字
-            price_per_gram = float(price_str.replace(',', ''))
-            # 2. 換算成錢 (1錢 = 3.75克)
-            price_per_mace = int(price_per_gram * 3.75)
-
-            reply_text = f"💰 台灣銀行今日金價 (黃金存摺)：\n👉 1錢賣出價：NT$ {price_per_mace:,}\n(原始克價：{price_str})"
+                if price_str:
+                    # 換算
+                    price_per_gram = float(price_str.replace(',', ''))
+                    price_per_mace = int(price_per_gram * 3.75)
+                    reply_text = f"💰 台灣銀行今日金價 (黃金存摺)：\n👉 1錢賣出價：NT$ {price_per_mace:,}\n(原始克價：{price_str})"
+                else:
+                    reply_text = "⚠️ 抓到了網頁但找不到價格，可能網頁改版了。"
 
         except Exception as e:
-            print(e)
-            reply_text = "⚠️ 抓取金價失敗，請稍後再試。"
+            print(f"金價抓取錯誤: {e}") # 這裡會把錯誤印在 Render 後台
+            reply_text = "⚠️ 系統發生錯誤，請檢查後台 Log。"
 
     # --- 功能 C: 匯率 ---
     elif text == '!匯率':
         try:
             url = "https://rate.bot.com.tw/xrt?Lang=zh-TW"
-            res = requests.get(url, headers=headers)
+            res = requests.get(url, headers=headers, timeout=10)
             soup = BeautifulSoup(res.text, "html.parser")
             
             found = False
             for row in soup.find('tbody').find_all('tr'):
                 if "JPY" in row.text:
                     tds = row.find_all('td')
+                    # 現金賣出通常在第 3 欄 (index 2)
                     sell_rate = tds[2].text.strip()
                     reply_text = f"🇯🇵 日幣 (JPY) 匯率：\n現金賣出：{sell_rate}\n(去銀行換錢的匯率)"
                     found = True
