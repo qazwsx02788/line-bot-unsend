@@ -33,13 +33,21 @@ static_tmp_path = os.path.join(os.path.dirname(__file__), 'static', 'tmp')
 os.makedirs(static_tmp_path, exist_ok=True)
 rooms_data = {}
 
+# --- 初始化房間資料 ---
 def get_room_data(source_id):
     if source_id not in rooms_data:
-        new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
-        random.shuffle(new_deck)
+        # 麻將牌堆
+        mahjong_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
+        random.shuffle(mahjong_deck)
+        
+        # 撲克牌堆 (1~13 代表 A~K, 4種花色)
+        poker_deck = [(rank, suit) for rank in range(1, 14) for suit in ['♠️', '♥️', '♦️', '♣️']]
+        random.shuffle(poker_deck)
+
         rooms_data[source_id] = {
             'debt': [], 
-            'deck': new_deck,
+            'deck': mahjong_deck,       
+            'poker': poker_deck,        
             'unsent_buffer': [] 
         }
     return rooms_data[source_id]
@@ -77,26 +85,49 @@ def callback():
         return 'OK'
     return 'OK'
 
-# --- 麻將圖示轉換 ---
+# --- 輔助函式: 推筒子 ---
 def get_tile_text(v):
-    tiles_map = {
-        1: "🀙", # 一筒
-        2: "🀚", # 二筒
-        3: "🀛", # 三筒
-        4: "🀜", # 四筒
-        5: "🀝", # 五筒
-        6: "🀞", # 六筒
-        7: "🀟", # 七筒
-        8: "🀠", # 八筒
-        9: "🀡", # 九筒
-        0.5: "🀆" # 白板
-    }
-    return tiles_map.get(v, "🀫") # 預設顯示背面
+    tiles_map = {1:"🀙",2:"🀚",3:"🀛",4:"🀜",5:"🀝",6:"🀞",7:"🀟",8:"🀠",9:"🀡",0.5:"🀆"}
+    return tiles_map.get(v, "🀫")
 
 def calculate_score(t1, t2):
     if t1 == t2: return "👑 白板對子 (通殺!)" if t1==0.5 else f"🔥 豹子 {int(t1)}對"
     pts = (t1 + t2) % 10
     return "💩 癟十" if pts==0 else f"{int(pts) if pts==int(pts) else pts} 點"
+
+# --- 輔助函式: 妞妞邏輯 (含倍數) ---
+def get_poker_text(card):
+    rank, suit = card
+    rank_str = {1:'A', 11:'J', 12:'Q', 13:'K'}.get(rank, str(rank))
+    return f"{suit}{rank_str}"
+
+def calculate_niu(hand):
+    values = []
+    for rank, suit in hand:
+        val = 10 if rank >= 10 else rank
+        values.append(val)
+    
+    import itertools
+    indices = list(range(5))
+    found_bull = False
+    bull_score = 0
+    
+    for combo in itertools.combinations(indices, 3):
+        sum3 = sum([values[i] for i in combo])
+        if sum3 % 10 == 0:
+            found_bull = True
+            leftover_indices = [i for i in indices if i not in combo]
+            sum2 = sum([values[i] for i in leftover_indices])
+            remainder = sum2 % 10
+            bull_score = 10 if remainder == 0 else remainder
+            break
+            
+    if found_bull:
+        if bull_score == 10: return "🐂 妞妞 (3倍!!)"
+        if bull_score >= 8: return f"🎉 牛{bull_score} (2倍!)"
+        return f"🐮 牛{bull_score} (1倍)"
+    else:
+        return "💩 烏龍 (沒牛)"
 
 # --- 處理文字訊息 ---
 @handler.add(MessageEvent, message=TextMessage)
@@ -110,42 +141,97 @@ def handle_text_message(event):
     message_store[msg_id] = text
     reply_messages = []
 
-    # --- 功能 X: 抓收回 (!抓) ---
-    if text == '!抓':
-        if not room.get('unsent_buffer'):
-            reply_messages.append(TextSendMessage(text="👻 目前沒有人收回訊息喔！"))
-        else:
-            for item in room['unsent_buffer']:
-                sender = item['sender']
-                msg_type = item['type']
-                content = item['content']
-                if msg_type == 'text':
-                    reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！剛剛「{sender}」收回了：\n{content}"))
-                elif msg_type == 'image':
-                    img_url = content
-                    reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！「{sender}」剛剛收回這張圖 👇"))
-                    reply_messages.append(ImageSendMessage(original_content_url=img_url, preview_image_url=img_url))
-            room['unsent_buffer'] = []
-
     # --- 功能 0: 指令表 ---
-    elif text == '!指令':
+    if text == '!指令':
         reply_text = (
             "🤖 機器人指令表：\n"
             "-----------------\n"
-            "🕵️ 防收回 \n"
-            "👉 !抓 : 顯示剛剛被收回的訊息\n\n"
-            "💰 記帳\n"
-            "👉 !記 @A 欠 @B 100 [備註]\n"
+            "🕵️ 防收回\n"
+            "👉 !抓 : 抓剛剛收回的訊息\n\n"
+            "🎮 娛樂區 (獨立牌堆)\n"
+            "👉 !推 : 玩推筒子\n"
+            "👉 !洗牌 : 重洗麻將 (推筒子用)\n"
+            "👉 !妞妞 : 玩撲克牌\n"
+            "👉 !洗乾淨 : 重洗撲克牌 (妞妞用)\n"
+            "👉 !骰子 : 擲骰子\n\n"
+            "💰 記帳區\n"
+            "👉 !記 @A 欠 @B 100\n"
             "👉 !還 @A 還 @B 100\n"
             "👉 !查帳 / !一筆勾銷\n\n"
-            "🎮 娛樂\n"
-            "👉 !推 : 這裡會顯示你的名字\n"
-            "👉 !洗牌 / !骰子\n\n"
-            "🛠 工具\n"
+            "🛠 工具區\n"
             "👉 !金價 / !匯率 / !天氣\n"
             "-----------------"
         )
         reply_messages.append(TextSendMessage(text=reply_text))
+
+    # --- 功能: 妞妞 (!妞妞) ---
+    elif text == '!妞妞':
+        poker = room['poker']
+        
+        if len(poker) < 5:
+            reply_messages.append(TextSendMessage(text="🃏 撲克牌沒了！自動洗牌中..."))
+            new_poker = [(r, s) for r in range(1, 14) for s in ['♠️', '♥️', '♦️', '♣️']]
+            random.shuffle(new_poker)
+            room['poker'] = new_poker
+            poker = room['poker']
+            reply_messages.append(TextSendMessage(text="✅ 撲克牌洗好了！"))
+
+        user_name = "玩家"
+        try:
+            if event.source.type == 'group':
+                user_name = line_bot_api.get_group_member_profile(event.source.group_id, user_id).display_name
+            else:
+                user_name = line_bot_api.get_profile(user_id).display_name
+        except: pass
+
+        hand = [poker.pop() for _ in range(5)]
+        score_desc = calculate_niu(hand)
+        hand_str = " ".join([get_poker_text(c) for c in hand])
+        
+        result_text = (
+            f"👤 {user_name} 的牌：\n"
+            f"{hand_str}\n"
+            f"📊 結果：{score_desc}\n"
+            f"(剩 {len(poker)} 張)"
+        )
+        reply_messages.append(TextSendMessage(text=result_text))
+
+    # --- 功能: 推筒子 (!推) ---
+    elif text == '!推':
+        deck = room['deck']
+        if len(deck) < 2:
+            reply_messages.append(TextSendMessage(text="🀄 麻將沒了！自動洗牌中..."))
+            new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
+            random.shuffle(new_deck)
+            room['deck'] = new_deck
+            deck = room['deck']
+            reply_messages.append(TextSendMessage(text="✅ 麻將洗好了！"))
+        
+        user_name = "玩家"
+        try:
+            if event.source.type == 'group':
+                user_name = line_bot_api.get_group_member_profile(event.source.group_id, user_id).display_name
+            else:
+                user_name = line_bot_api.get_profile(user_id).display_name
+        except: pass
+
+        t1 = deck.pop(); t2 = deck.pop()
+        score_desc = calculate_score(t1, t2)
+        reply_messages.append(TextSendMessage(text=f"👤 {user_name} 的牌：\n{get_tile_text(t1)} {get_tile_text(t2)}\n📊 結果：{score_desc}\n(剩 {len(deck)} 張)"))
+
+    # --- 功能: 洗麻將 (!洗牌) ---
+    elif text == '!洗牌':
+        new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
+        random.shuffle(new_deck)
+        room['deck'] = new_deck
+        reply_messages.append(TextSendMessage(text="🔄 [本群] 麻將已洗牌！\n(推筒子專用)"))
+
+    # --- 功能: 洗撲克 (!洗乾淨) ---
+    elif text == '!洗乾淨':
+        new_poker = [(r, s) for r in range(1, 14) for s in ['♠️', '♥️', '♦️', '♣️']]
+        random.shuffle(new_poker)
+        room['poker'] = new_poker
+        reply_messages.append(TextSendMessage(text="🃏 [本群] 撲克牌已洗乾淨！\n(妞妞專用)"))
 
     # --- 記帳 ---
     elif text.startswith('!記 '):
@@ -192,42 +278,27 @@ def handle_text_message(event):
         room['debt'].clear()
         reply_messages.append(TextSendMessage(text="🧹 [本群] 帳本已清空！"))
 
-    # --- 娛樂 (推筒子 - 麻將圖示版) ---
-    elif text == '!推':
-        deck = room['deck']
-        if len(deck) < 2:
-            new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
-            random.shuffle(new_deck)
-            room['deck'] = new_deck
-            deck = room['deck']
-            reply_messages.append(TextSendMessage(text="✅ 洗牌完成！"))
-        
-        user_name = "玩家"
-        try:
-            if event.source.type == 'group':
-                profile = line_bot_api.get_group_member_profile(event.source.group_id, user_id)
-                user_name = profile.display_name
-            else:
-                profile = line_bot_api.get_profile(user_id)
-                user_name = profile.display_name
-        except: 
-            pass
+    # --- 功能: 抓收回 (!抓) ---
+    elif text == '!抓':
+        if not room.get('unsent_buffer'):
+            reply_messages.append(TextSendMessage(text="👻 目前沒有人收回訊息喔！"))
+        else:
+            for item in room['unsent_buffer']:
+                sender = item['sender']
+                msg_type = item['type']
+                content = item['content']
+                if msg_type == 'text':
+                    reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！剛剛「{sender}」收回了：\n{content}"))
+                elif msg_type == 'image':
+                    img_url = content
+                    reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！「{sender}」剛剛收回這張圖 👇"))
+                    reply_messages.append(ImageSendMessage(original_content_url=img_url, preview_image_url=img_url))
+            room['unsent_buffer'] = []
 
-        t1 = deck.pop(); t2 = deck.pop()
-        score_desc = calculate_score(t1, t2)
-        # 回覆時帶上名字 + 麻將圖示
-        reply_messages.append(TextSendMessage(text=f"👤 {user_name} 的牌：\n{get_tile_text(t1)} {get_tile_text(t2)}\n📊 結果：{score_desc}\n(剩 {len(deck)} 張)"))
-
-    elif text == '!洗牌':
-        new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
-        random.shuffle(new_deck)
-        room['deck'] = new_deck
-        reply_messages.append(TextSendMessage(text="🔄 [本群] 手動洗牌完成！"))
-
+    # --- 其他工具 ---
     elif text == '!骰子':
         reply_messages.append(TextSendMessage(text=f"🎲 擲出了：{random.randint(1, 6)} 點"))
 
-    # --- 工具 ---
     elif text == '!金價':
         try:
             url = "https://999k.com.tw/"
@@ -285,7 +356,6 @@ def handle_image(event):
     with open(os.path.join(static_tmp_path, f"{msg_id}.jpg"), 'wb') as fd:
         for chunk in content.iter_content(): fd.write(chunk)
 
-# --- 處理收回 (被動免費版) ---
 @handler.add(UnsendEvent)
 def handle_unsend(event):
     uid = event.unsend.message_id
@@ -304,14 +374,11 @@ def handle_unsend(event):
     except: pass
 
     img_path = os.path.join(static_tmp_path, f"{uid}.jpg")
-    
-    if 'unsent_buffer' not in room:
-        room['unsent_buffer'] = []
+    if 'unsent_buffer' not in room: room['unsent_buffer'] = []
 
     if os.path.exists(img_path):
         url = f"{FQDN}/static/tmp/{uid}.jpg"
         room['unsent_buffer'].append({'sender': sender_name, 'type': 'image', 'content': url})
-
     elif uid in message_store:
         msg = message_store[uid]
         room['unsent_buffer'].append({'sender': sender_name, 'type': 'text', 'content': msg})
