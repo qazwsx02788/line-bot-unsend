@@ -3,6 +3,7 @@ import random
 import requests
 import threading
 import time
+from datetime import datetime
 from bs4 import BeautifulSoup
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -23,12 +24,21 @@ FQDN = "https://line-bot-unsend.onrender.com"
 line_bot_api = LineBotApi(os.environ.get('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('CHANNEL_SECRET'))
 
-# 暫存文字訊息
+# 資料儲存
 message_store = {}
-
-# 建立圖片暫存資料夾
 static_tmp_path = os.path.join(os.path.dirname(__file__), 'static', 'tmp')
 os.makedirs(static_tmp_path, exist_ok=True)
+
+# --- 記帳資料 (記憶體暫存，重啟會消失) ---
+debt_records = []
+
+# --- 真實牌堆 ---
+current_deck = []
+def shuffle_deck():
+    global current_deck
+    current_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
+    random.shuffle(current_deck)
+shuffle_deck()
 
 # 定期清理舊圖片
 def cleanup_images():
@@ -39,18 +49,14 @@ def cleanup_images():
                 f_path = os.path.join(static_tmp_path, f)
                 if os.stat(f_path).st_mtime < now - 3600:
                     os.remove(f_path)
-        except:
-            pass
+        except: pass
         time.sleep(3600)
 
 threading.Thread(target=cleanup_images, daemon=True).start()
 
-# 首頁
 @app.route("/")
-def home():
-    return "Robot is Alive!"
+def home(): return "Robot is Alive!"
 
-# 偽裝 Header
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -65,67 +71,122 @@ def callback():
         abort(400)
     return 'OK'
 
+# --- 輔助函式 ---
+def get_tile_text(v):
+    return {1:"🀙",2:"🀚",3:"🀛",4:"🀜",5:"🀝",6:"🀞",7:"🀟",8:"🀠",9:"🀡",0.5:"🀆"}.get(v,"?")
+
+def calculate_score(t1, t2):
+    if t1 == t2: return "👑 白板對子 (通殺!)" if t1==0.5 else f"🔥 豹子 {int(t1)}對"
+    pts = (t1 + t2) % 10
+    return "💩 癟十" if pts==0 else f"{int(pts) if pts==int(pts) else pts} 點"
+
 # --- 處理文字訊息 ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     msg_id = event.message.id
     text = event.message.text.strip()
     user_id = event.source.user_id
-    
-    # 存文字訊息
     message_store[msg_id] = text
-
-    reply_text = None
+    reply_messages = []
 
     # --- 功能 0: 指令表 ---
     if text == '!指令':
         reply_text = (
             "🤖 機器人指令表：\n"
             "-----------------\n"
+            "💰 短期記帳 (重啟會清空)\n"
+            "👉 !記 @A 欠 @B 100 [備註]\n"
+            "👉 !還 @A 還 @B 100\n"
+            "👉 !查帳 : 列出欠款總結\n"
+            "👉 !一筆勾銷 : 清空帳本\n\n"
             "🎮 娛樂區\n"
-            "👉 !推 : 玩推筒子\n"
-            "👉 !骰子 : 擲骰子\n\n"
+            "👉 !推 / !洗牌 / !骰子\n\n"
             "🛠 工具區\n"
-            "👉 !金價 : 查今日飾金賣出價\n"
-            "👉 !匯率 : 查日幣匯率\n"
-            "👉 !天氣 : 查平鎮氣溫\n"
-            "👉 !天氣 [地名] : 查全球氣溫\n"
-            "   (例: !天氣 東京、!天氣 紐約)\n"
+            "👉 !金價 / !匯率 / !天氣\n"
             "-----------------"
         )
+        reply_messages.append(TextSendMessage(text=reply_text))
 
-    # --- 功能 E: 多人推筒子 ---
+    # --- 記帳功能 ---
+    elif text.startswith('!記 '):
+        try:
+            parts = text.split()
+            if '欠' in parts and len(parts) >= 5:
+                idx = parts.index('欠')
+                d, c, amt = parts[1], parts[idx+1], int(parts[idx+2])
+                note = " ".join(parts[idx+3:]) if len(parts) > idx+3 else "無備註"
+                debt_records.append({'d': d, 'c': c, 'amt': amt, 'note': note, 'time': datetime.now().strftime("%H:%M")})
+                reply_messages.append(TextSendMessage(text=f"📝 已記錄：\n{d} 欠 {c} ${amt}\n({note})"))
+            else: reply_messages.append(TextSendMessage(text="⚠️ 格式：!記 @A 欠 @B 100 備註"))
+        except: reply_messages.append(TextSendMessage(text="⚠️ 格式錯誤或金額非數字。"))
+
+    elif text.startswith('!還 '):
+        try:
+            parts = text.split()
+            if '還' in parts and len(parts) >= 5:
+                d, c, amt = parts[1], parts[3], int(parts[4])
+                debt_records.append({'d': d, 'c': c, 'amt': -amt, 'note': '還款', 'time': datetime.now().strftime("%H:%M")})
+                reply_messages.append(TextSendMessage(text=f"💸 已扣除：\n{d} 還 {c} ${amt}"))
+            else: reply_messages.append(TextSendMessage(text="⚠️ 格式：!還 @A 還 @B 100"))
+        except: reply_messages.append(TextSendMessage(text="⚠️ 格式錯誤。"))
+
+    elif text == '!查帳':
+        if not debt_records:
+            reply_messages.append(TextSendMessage(text="📭 目前沒有欠款紀錄！"))
+        else:
+            summary = {}
+            for r in debt_records:
+                k = (r['d'], r['c'])
+                if k not in summary: summary[k] = 0
+                summary[k] += r['amt']
+            
+            res = "📊 【欠款總結】\n"
+            has_debt = False
+            for (d, c), total in summary.items():
+                if total > 0:
+                    has_debt = True
+                    res += f"🔴 {d} 欠 {c}：${total}\n"
+            if not has_debt: res += "✅ 所有帳目已結清！\n"
+            
+            res += "\n🧾 【近期明細】\n"
+            for r in debt_records[-10:]: # 只顯示最後10筆避免洗版
+                action = "欠" if r['amt'] > 0 else "還"
+                res += f"[{r['time']}] {r['d']} {action} {r['c']} ${abs(r['amt'])}\n"
+            
+            reply_messages.append(TextSendMessage(text=res))
+
+    elif text == '!一筆勾銷':
+        debt_records.clear()
+        reply_messages.append(TextSendMessage(text="🧹 帳本已清空！"))
+
+    # --- 娛樂功能 ---
     elif text == '!推':
+        global current_deck
+        if len(current_deck) < 2:
+            reply_messages.append(TextSendMessage(text="🀄 牌底沒了！自動洗牌中..."))
+            shuffle_deck()
+            reply_messages.append(TextSendMessage(text="✅ 洗牌完成！"))
+        
         user_name = "玩家"
         try:
             if event.source.type == 'group':
-                profile = line_bot_api.get_group_member_profile(event.source.group_id, user_id)
-                user_name = profile.display_name
+                user_name = line_bot_api.get_group_member_profile(event.source.group_id, user_id).display_name
             else:
-                profile = line_bot_api.get_profile(user_id)
-                user_name = profile.display_name
-        except:
-            pass
+                user_name = line_bot_api.get_profile(user_id).display_name
+        except: pass
 
-        deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
-        hand = random.sample(deck, 2)
-        
-        def get_tile_text(v):
-            return {1:"🀙",2:"🀚",3:"🀛",4:"🀜",5:"🀝",6:"🀞",7:"🀟",8:"🀠",9:"🀡",0.5:"🀆"}.get(v,"?")
+        t1 = current_deck.pop(); t2 = current_deck.pop()
+        score_desc = calculate_score(t1, t2)
+        reply_messages.append(TextSendMessage(text=f"👤 {user_name} 的牌：\n🀄 {get_tile_text(t1)} {get_tile_text(t2)}\n📊 結果：{score_desc}\n(剩 {len(current_deck)} 張)"))
 
-        def calculate_score(t1, t2):
-            if t1 == t2: return "👑 白板對子" if t1==0.5 else f"🔥 豹子 {int(t1)}對"
-            pts = (t1 + t2) % 10
-            return "💩 癟十" if pts==0 else f"{int(pts) if pts==int(pts) else pts} 點"
+    elif text == '!洗牌':
+        shuffle_deck()
+        reply_messages.append(TextSendMessage(text="🔄 手動洗牌完成！"))
 
-        score_desc = calculate_score(hand[0], hand[1])
-        reply_text = f"👤 {user_name} 的牌：\n🀄 {get_tile_text(hand[0])} {get_tile_text(hand[1])}\n📊 結果：{score_desc}"
-
-    # --- 功能 A: 骰子 ---
     elif text == '!骰子':
-        reply_text = f"🎲 擲出了：{random.randint(1, 6)} 點"
+        reply_messages.append(TextSendMessage(text=f"🎲 擲出了：{random.randint(1, 6)} 點"))
 
-    # --- 功能 B: 金價 (999k.com.tw) ---
+    # --- 工具功能 ---
     elif text == '!金價':
         try:
             url = "https://999k.com.tw/"
@@ -139,101 +200,63 @@ def handle_text_message(event):
                     for td in row.find_all('td'):
                         val = td.text.strip().replace(',', '')
                         if val.isdigit() and len(val) >= 4:
-                            price_str = val
-                            break
+                            price_str = val; break
                 if price_str: break
-            
-            if price_str:
-                reply_text = f"💰 今日金價 (展寬珠寶/三井)：\n👉 1錢賣出價：NT$ {price_str}\n(資料來源：999k.com.tw)"
-            else:
-                reply_text = "⚠️ 抓不到價格，可能網站改版。"
-        except:
-            reply_text = "⚠️ 抓取金價失敗。"
+            msg = f"💰 今日金價 (展寬/三井)：\n👉 1錢賣出價：NT$ {price_str}" if price_str else "⚠️ 抓不到價格。"
+        except: msg = "⚠️ 抓取金價失敗。"
+        reply_messages.append(TextSendMessage(text=msg))
 
-    # --- 功能 C: 匯率 ---
     elif text == '!匯率':
         try:
-            url = "https://rate.bot.com.tw/xrt?Lang=zh-TW"
-            res = requests.get(url, headers=headers, timeout=10)
+            res = requests.get("https://rate.bot.com.tw/xrt?Lang=zh-TW", headers=headers, timeout=10)
             soup = BeautifulSoup(res.text, "html.parser")
             found = False
             for row in soup.find('tbody').find_all('tr'):
                 if "JPY" in row.text:
-                    sell_rate = row.find_all('td')[2].text.strip()
-                    reply_text = f"🇯🇵 日幣 (JPY) 匯率：\n現金賣出：{sell_rate}"
-                    found = True
-                    break
-            if not found: reply_text = "⚠️ 找不到日幣資料。"
-        except:
-            reply_text = "⚠️ 抓取匯率失敗。"
+                    rate = row.find_all('td')[2].text.strip()
+                    msg = f"🇯🇵 日幣 (JPY) 現金賣出：{rate}"; found=True; break
+            if not found: msg = "⚠️ 找不到日幣資料。"
+        except: msg = "⚠️ 抓取匯率失敗。"
+        reply_messages.append(TextSendMessage(text=msg))
 
-    # --- 功能 D: 全球天氣 (新功能) ---
     elif text.startswith('!天氣'):
-        # 1. 取得使用者輸入的地點
-        query_location = text.replace('!天氣', '').strip()
-        
-        lat, lon, location_name = None, None, None
-
-        if not query_location:
-            # 如果沒輸入地點，預設平鎮
-            lat, lon, location_name = 24.9442, 121.2192, "桃園平鎮"
-        else:
-            # 如果有輸入，使用 Geocoding API 搜尋座標
+        q = text.replace('!天氣', '').strip()
+        lat, lon, loc = 24.9442, 121.2192, "桃園平鎮"
+        if q:
             try:
-                geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={query_location}&count=1&language=zh&format=json"
-                geo_res = requests.get(geo_url, headers=headers).json()
-                
-                if "results" in geo_res and len(geo_res["results"]) > 0:
-                    result = geo_res["results"][0]
-                    lat = result["latitude"]
-                    lon = result["longitude"]
-                    location_name = result["name"] # 抓取 API 回傳的正式名稱
-                else:
-                    reply_text = f"⚠️ 找不到「{query_location}」這個地方喔！"
-            except:
-                reply_text = "⚠️ 地點搜尋發生錯誤。"
+                g = requests.get(f"https://geocoding-api.open-meteo.com/v1/search?name={q}&count=1&language=zh&format=json", headers=headers).json()
+                if "results" in g: lat,lon,loc = g["results"][0]["latitude"], g["results"][0]["longitude"], g["results"][0]["name"]
+                else: reply_messages.append(TextSendMessage(text=f"⚠️ 找不到「{q}」。"))
+            except: pass
+        try:
+            w = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=auto", headers=headers).json()
+            reply_messages.append(TextSendMessage(text=f"🌤 {loc} 目前氣溫：{w['current_weather']['temperature']}°C"))
+        except:
+            reply_messages.append(TextSendMessage(text="⚠️ 氣象資料失敗。"))
 
-        # 如果成功取得了座標，就去查天氣
-        if lat and lon:
-            try:
-                api = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=auto"
-                res = requests.get(api, headers=headers).json()
-                temp = res['current_weather']['temperature']
-                reply_text = f"🌤 {location_name} 目前氣溫：{temp}°C"
-            except:
-                reply_text = "⚠️ 氣象資料讀取失敗。"
+    if reply_messages:
+        line_bot_api.reply_message(event.reply_token, reply_messages)
 
-    if reply_text:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-
-# --- 處理圖片訊息 ---
+# --- 處理圖片 ---
 @handler.add(MessageEvent, message=ImageMessage)
-def handle_image_message(event):
+def handle_image(event):
     msg_id = event.message.id
-    message_content = line_bot_api.get_message_content(msg_id)
-    file_path = os.path.join(static_tmp_path, f"{msg_id}.jpg")
-    with open(file_path, 'wb') as fd:
-        for chunk in message_content.iter_content():
-            fd.write(chunk)
+    content = line_bot_api.get_message_content(msg_id)
+    with open(os.path.join(static_tmp_path, f"{msg_id}.jpg"), 'wb') as fd:
+        for chunk in content.iter_content(): fd.write(chunk)
 
-# --- 處理收回事件 ---
+# --- 處理收回 ---
 @handler.add(UnsendEvent)
 def handle_unsend(event):
-    unsent_id = event.unsend.message_id
-    img_path = os.path.join(static_tmp_path, f"{unsent_id}.jpg")
+    uid = event.unsend.message_id
+    img = os.path.join(static_tmp_path, f"{uid}.jpg")
+    tid = event.source.group_id if event.source.type == 'group' else event.source.user_id
     
-    if os.path.exists(img_path):
-        img_url = f"{FQDN}/static/tmp/{unsent_id}.jpg"
-        msg = ImageSendMessage(original_content_url=img_url, preview_image_url=img_url)
-        reply_text = "抓到了！有人收回圖片 (如下) 👇"
-        target_id = event.source.group_id if event.source.type == 'group' else event.source.user_id
-        line_bot_api.push_message(target_id, [TextSendMessage(text=reply_text), msg])
-            
-    elif unsent_id in message_store:
-        msg = message_store[unsent_id]
-        reply = f"抓到了！有人收回訊息：\n{msg}"
-        target_id = event.source.group_id if event.source.type == 'group' else event.source.user_id
-        line_bot_api.push_message(target_id, TextSendMessage(text=reply))
+    if os.path.exists(img):
+        url = f"{FQDN}/static/tmp/{uid}.jpg"
+        line_bot_api.push_message(tid, [TextSendMessage(text="抓到了！有人收回圖片 👇"), ImageSendMessage(original_content_url=url, preview_image_url=url)])
+    elif uid in message_store:
+        line_bot_api.push_message(tid, TextSendMessage(text=f"抓到了！有人收回訊息：\n{message_store[uid]}"))
 
 if __name__ == "__main__":
     app.run()
