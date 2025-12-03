@@ -17,7 +17,7 @@ from linebot.models import (
 app = Flask(__name__)
 
 # ==========================================
-# 👇 請改成你的 Render 網址 (後面不要有 /)
+# 👇 請改成你的 Render 網址
 FQDN = "https://line-bot-unsend.onrender.com"
 # ==========================================
 
@@ -33,22 +33,25 @@ static_tmp_path = os.path.join(os.path.dirname(__file__), 'static', 'tmp')
 os.makedirs(static_tmp_path, exist_ok=True)
 rooms_data = {}
 
-# --- 初始化房間資料 ---
 def get_room_data(source_id):
     if source_id not in rooms_data:
-        # 麻將牌堆
-        mahjong_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
-        random.shuffle(mahjong_deck)
-        
-        # 撲克牌堆 (1~13 代表 A~K, 4種花色)
-        poker_deck = [(rank, suit) for rank in range(1, 14) for suit in ['♠️', '♥️', '♦️', '♣️']]
-        random.shuffle(poker_deck)
-
+        new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
+        random.shuffle(new_deck)
         rooms_data[source_id] = {
             'debt': [], 
-            'deck': mahjong_deck,       
-            'poker': poker_deck,        
-            'unsent_buffer': [] 
+            'deck': new_deck,
+            'unsent_buffer': [],
+            # 賭局狀態
+            'game': {
+                'banker_id': None,
+                'banker_name': None,
+                'banker_card_val': None, 
+                'banker_desc': "",       
+                'bets': {},              
+                'player_results': {},    # 閒家點數暫存
+                'session_log': [],       
+                'played_users': []       
+            }
         }
     return rooms_data[source_id]
 
@@ -85,49 +88,36 @@ def callback():
         return 'OK'
     return 'OK'
 
-# --- 輔助函式: 推筒子 ---
+# --- 推筒子邏輯 ---
 def get_tile_text(v):
-    tiles_map = {1:"🀙",2:"🀚",3:"🀛",4:"🀜",5:"🀝",6:"🀞",7:"🀟",8:"🀠",9:"🀡",0.5:"🀆"}
+    tiles_map = {
+        1: "🀙", 2: "🀚", 3: "🀛", 4: "🀜", 5: "🀝",
+        6: "🀞", 7: "🀟", 8: "🀠", 9: "🀡", 0.5: "🀆"
+    }
     return tiles_map.get(v, "🀫")
 
 def calculate_score(t1, t2):
-    if t1 == t2: return "👑 白板對子 (通殺!)" if t1==0.5 else f"🔥 豹子 {int(t1)}對"
+    if t1 == t2: return "👑 白板對子" if t1==0.5 else f"🔥 豹子 {int(t1)}對"
     pts = (t1 + t2) % 10
     return "💩 癟十" if pts==0 else f"{int(pts) if pts==int(pts) else pts} 點"
 
-# --- 輔助函式: 妞妞邏輯 (含倍數) ---
-def get_poker_text(card):
-    rank, suit = card
-    rank_str = {1:'A', 11:'J', 12:'Q', 13:'K'}.get(rank, str(rank))
-    return f"{suit}{rank_str}"
+def get_score_value(t1, t2):
+    if t1 == t2: return 1000 if t1 == 0.5 else 100 + t1
+    score = (t1 + t2) % 10
+    return 0 if score == 0 else score
 
-def calculate_niu(hand):
-    values = []
-    for rank, suit in hand:
-        val = 10 if rank >= 10 else rank
-        values.append(val)
-    
-    import itertools
-    indices = list(range(5))
-    found_bull = False
-    bull_score = 0
-    
-    for combo in itertools.combinations(indices, 3):
-        sum3 = sum([values[i] for i in combo])
-        if sum3 % 10 == 0:
-            found_bull = True
-            leftover_indices = [i for i in indices if i not in combo]
-            sum2 = sum([values[i] for i in leftover_indices])
-            remainder = sum2 % 10
-            bull_score = 10 if remainder == 0 else remainder
-            break
-            
-    if found_bull:
-        if bull_score == 10: return "🐂 妞妞 (3倍!!)"
-        if bull_score >= 8: return f"🎉 牛{bull_score} (2倍!)"
-        return f"🐮 牛{bull_score} (1倍)"
-    else:
-        return "💩 烏龍 (沒牛)"
+# 抓取使用者名稱
+def get_user_name(event, user_id=None):
+    if not user_id: user_id = event.source.user_id
+    try:
+        if event.source.type == 'group':
+            profile = line_bot_api.get_group_member_profile(event.source.group_id, user_id)
+            return profile.display_name
+        else:
+            profile = line_bot_api.get_profile(user_id)
+            return profile.display_name
+    except:
+        return "玩家"
 
 # --- 處理文字訊息 ---
 @handler.add(MessageEvent, message=TextMessage)
@@ -146,94 +136,214 @@ def handle_text_message(event):
         reply_text = (
             "🤖 機器人指令表：\n"
             "-----------------\n"
-            "🕵️ 防收回\n"
-            "👉 !抓 : 抓剛剛收回的訊息\n\n"
-            "🎮 娛樂區 (獨立牌堆)\n"
-            "👉 !推 : 玩推筒子\n"
-            "👉 !洗牌 : 重洗麻將 (推筒子用)\n"
-            "👉 !妞妞 : 玩撲克牌\n"
-            "👉 !洗乾淨 : 重洗撲克牌 (妞妞用)\n"
-            "👉 !骰子 : 擲骰子\n\n"
+            "🎰 流水局 (自動結算)\n"
+            "1. 👉 !搶莊 : 開新大局\n"
+            "2. 👉 !下注 200 : 設定下注 (自動延用)\n"
+            "3. 👉 !推 : 發牌 (所有人開完自動結算)\n"
+            "   ⚠️ 單局重複推 = 罰款$100\n"
+            "4. 👉 !收牌 : 強制結算本局\n"
+            "   ⚠️ 沒推牌者判輸\n"
+            "5. 👉 !下莊 : 結束大局，寫入公帳\n\n"
             "💰 記帳區\n"
-            "👉 !記 @A 欠 @B 100\n"
-            "👉 !還 @A 還 @B 100\n"
-            "👉 !查帳 / !一筆勾銷\n\n"
-            "🛠 工具區\n"
-            "👉 !金價 / !匯率 / !天氣\n"
+            "👉 !記 / !還 / !查帳 / !一筆勾銷\n"
             "-----------------"
         )
         reply_messages.append(TextSendMessage(text=reply_text))
 
-    # --- 功能: 妞妞 (!妞妞) ---
-    elif text == '!妞妞':
-        poker = room['poker']
-        
-        if len(poker) < 5:
-            reply_messages.append(TextSendMessage(text="🃏 撲克牌沒了！自動洗牌中..."))
-            new_poker = [(r, s) for r in range(1, 14) for s in ['♠️', '♥️', '♦️', '♣️']]
-            random.shuffle(new_poker)
-            room['poker'] = new_poker
-            poker = room['poker']
-            reply_messages.append(TextSendMessage(text="✅ 撲克牌洗好了！"))
-
-        user_name = "玩家"
-        try:
-            if event.source.type == 'group':
-                user_name = line_bot_api.get_group_member_profile(event.source.group_id, user_id).display_name
-            else:
-                user_name = line_bot_api.get_profile(user_id).display_name
-        except: pass
-
-        hand = [poker.pop() for _ in range(5)]
-        score_desc = calculate_niu(hand)
-        hand_str = " ".join([get_poker_text(c) for c in hand])
-        
-        result_text = (
-            f"👤 {user_name} 的牌：\n"
-            f"{hand_str}\n"
-            f"📊 結果：{score_desc}\n"
-            f"(剩 {len(poker)} 張)"
-        )
-        reply_messages.append(TextSendMessage(text=result_text))
-
-    # --- 功能: 推筒子 (!推) ---
-    elif text == '!推':
-        deck = room['deck']
-        if len(deck) < 2:
-            reply_messages.append(TextSendMessage(text="🀄 麻將沒了！自動洗牌中..."))
-            new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
-            random.shuffle(new_deck)
-            room['deck'] = new_deck
-            deck = room['deck']
-            reply_messages.append(TextSendMessage(text="✅ 麻將洗好了！"))
-        
-        user_name = "玩家"
-        try:
-            if event.source.type == 'group':
-                user_name = line_bot_api.get_group_member_profile(event.source.group_id, user_id).display_name
-            else:
-                user_name = line_bot_api.get_profile(user_id).display_name
-        except: pass
-
-        t1 = deck.pop(); t2 = deck.pop()
-        score_desc = calculate_score(t1, t2)
-        reply_messages.append(TextSendMessage(text=f"👤 {user_name} 的牌：\n{get_tile_text(t1)} {get_tile_text(t2)}\n📊 結果：{score_desc}\n(剩 {len(deck)} 張)"))
-
-    # --- 功能: 洗麻將 (!洗牌) ---
-    elif text == '!洗牌':
+    # --- 🎰 大局控制 ---
+    elif text == '!搶莊':
         new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
         random.shuffle(new_deck)
         room['deck'] = new_deck
-        reply_messages.append(TextSendMessage(text="🔄 [本群] 麻將已洗牌！\n(推筒子專用)"))
+        
+        banker_name = get_user_name(event)
+        room['game'] = {
+            'banker_id': user_id,
+            'banker_name': banker_name,
+            'banker_card_val': None,
+            'banker_desc': "",
+            'bets': {},
+            'player_results': {},
+            'session_log': [],
+            'played_users': []
+        }
+        reply_messages.append(TextSendMessage(text=f"👑 新局開始！莊家：{banker_name}\n🀄 牌已洗好 (40張)\n👉 閒家請「!下注」，所有人都「!推」完會自動下一局"))
 
-    # --- 功能: 洗撲克 (!洗乾淨) ---
-    elif text == '!洗乾淨':
-        new_poker = [(r, s) for r in range(1, 14) for s in ['♠️', '♥️', '♦️', '♣️']]
-        random.shuffle(new_poker)
-        room['poker'] = new_poker
-        reply_messages.append(TextSendMessage(text="🃏 [本群] 撲克牌已洗乾淨！\n(妞妞專用)"))
+    elif text == '!下莊':
+        game = room['game']
+        if not game['banker_id']:
+            reply_messages.append(TextSendMessage(text="⚠️ 無莊家。"))
+        else:
+            if not game['session_log']:
+                reply_messages.append(TextSendMessage(text="⚠️ 本次大局沒有輸贏紀錄。"))
+            else:
+                count = 0
+                summary_text = "🧾 【大局結算】\n"
+                for r in game['session_log']:
+                    room['debt'].append(r)
+                    count += 1
+                    summary_text += f"▪ {r['d']} {r['note']} {r['c']} ${r['amt']}\n"
+                
+                game['banker_id'] = None
+                game['session_log'] = []
+                game['bets'] = {}
+                
+                reply_messages.append(TextSendMessage(text=f"{summary_text}\n✅ 已寫入公帳！莊家下台。"))
 
-    # --- 記帳 ---
+    # --- 🃏 下注 ---
+    elif text.startswith('!下注'):
+        game = room['game']
+        if not game['banker_id']:
+            reply_messages.append(TextSendMessage(text="⚠️ 沒人做莊！請先「!搶莊」"))
+        elif user_id == game['banker_id']:
+            reply_messages.append(TextSendMessage(text="⚠️ 莊家不用下注"))
+        elif user_id in game['played_users']:
+            reply_messages.append(TextSendMessage(text="⚠️ 本局已推牌，下局生效"))
+        else:
+            try:
+                parts = text.split()
+                amount = 100
+                if len(parts) > 1 and parts[1].isdigit():
+                    amount = int(parts[1])
+                
+                player_name = get_user_name(event)
+                game['bets'][user_id] = {'amount': amount, 'name': player_name}
+                reply_messages.append(TextSendMessage(text=f"💰 {player_name} 下注 ${amount} (之後自動延用)"))
+            except: pass
+
+    # --- 🃏 強制收牌 (有人死不開牌時用) ---
+    elif text == '!收牌':
+        game = room['game']
+        deck = room['deck']
+        
+        if not game['banker_id']: return
+        
+        # 1. 抓沒推牌的
+        missing_text = ""
+        timestamp = datetime.now().strftime("%H:%M")
+        
+        for pid, info in game['bets'].items():
+            if pid not in game['played_users']:
+                amt = info['amount']
+                p_name = info['name']
+                missing_text += f"💤 {p_name} 沒開牌 ❌ 輸 ${amt}\n"
+                game['session_log'].append({'d': p_name, 'c': game['banker_name'], 'amt': amt, 'note': '未開牌判輸', 'time': timestamp})
+
+        # 2. 自動洗牌檢查
+        shuffle_msg = ""
+        needed = (len(game['bets']) + 1) * 2
+        if len(deck) < needed:
+            new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
+            random.shuffle(new_deck)
+            room['deck'] = new_deck
+            shuffle_msg = "\n🀄 牌底不夠了，已自動洗牌！"
+
+        # 3. 重置
+        game['played_users'] = []
+        game['player_results'] = {}
+        game['banker_card_val'] = None
+        game['banker_desc'] = ""
+        
+        reply_msg = f"🔄 強制結算！{shuffle_msg}\n"
+        if missing_text: reply_msg += f"----------------\n{missing_text}"
+        reply_msg += "👉 下一局開始，請直接「!推」"
+        
+        reply_messages.append(TextSendMessage(text=reply_msg))
+
+    # --- 核心：自動結算推牌 (!推) ---
+    elif text == '!推':
+        game = room['game']
+        deck = room['deck']
+        user_name = get_user_name(event)
+
+        if not game['banker_id']:
+            # 路人模式
+            if len(deck) < 2:
+                deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4; random.shuffle(deck); room['deck']=deck
+            t1, t2 = deck.pop(), deck.pop()
+            reply_messages.append(TextSendMessage(text=f"👤 {user_name}：{get_tile_text(t1)} {get_tile_text(t2)} ({calculate_score(t1, t2)})"))
+            
+        else:
+            # 1. 檢查重複推
+            if user_id in game['played_users']:
+                log = {'d': user_name, 'c': '公桶', 'amt': 100, 'note': '手賤罰款', 'time': datetime.now().strftime("%H:%M")}
+                game['session_log'].append(log)
+                reply_messages.append(TextSendMessage(text=f"😡 {user_name} 重複推牌！罰 $100"))
+            
+            # 2. 檢查資格
+            elif user_id != game['banker_id'] and user_id not in game['bets']:
+                reply_messages.append(TextSendMessage(text=f"⚠️ {user_name} 沒下注不能玩！"))
+                
+            else:
+                # 3. 發牌
+                if len(deck) < 2:
+                    new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4; random.shuffle(new_deck); room['deck'] = new_deck
+                    deck = room['deck']
+                    reply_messages.append(TextSendMessage(text="🀄 自動洗牌完成！"))
+
+                t1, t2 = deck.pop(), deck.pop()
+                val = get_score_value(t1, t2)
+                desc = calculate_score(t1, t2)
+                
+                game['played_users'].append(user_id)
+                output_msg = "" # 用來累積回覆訊息
+
+                if user_id == game['banker_id']:
+                    game['banker_card_val'] = val
+                    game['banker_desc'] = f"{get_tile_text(t1)} {get_tile_text(t2)} ({desc})"
+                    output_msg = f"👑 莊家 {user_name} 開牌：\n{game['banker_desc']}\n"
+                else:
+                    output_msg = f"👤 {user_name} 開牌：\n{get_tile_text(t1)} {get_tile_text(t2)} ({desc})\n"
+                    # 存入閒家結果
+                    game['player_results'][user_id] = {'val': val, 'name': user_name}
+
+                # --- 🔥 關鍵：檢查是否所有人都開完了 ---
+                # 條件：(莊家已開) AND (所有下注的閒家都已開)
+                all_bets_users = set(game['bets'].keys())
+                all_played_users = set(game['played_users'])
+                
+                if game['banker_card_val'] is not None and all_bets_users.issubset(all_played_users):
+                    
+                    # 開始結算
+                    output_msg += "\n⚔️ 所有人到齊！本局結算：\n"
+                    b_val = game['banker_card_val']
+                    b_name = game['banker_name']
+                    timestamp = datetime.now().strftime("%H:%M")
+
+                    for pid in game['bets']:
+                        p_res = game['player_results'].get(pid)
+                        if not p_res: continue
+                        
+                        p_val = p_res['val']
+                        p_name = p_res['name']
+                        amt = game['bets'][pid]['amount']
+
+                        if p_val > b_val:
+                            output_msg += f"✅ {p_name} 贏 ${amt}\n"
+                            game['session_log'].append({'d': b_name, 'c': p_name, 'amt': amt, 'note': '推筒', 'time': timestamp})
+                        elif p_val < b_val:
+                            output_msg += f"❌ {p_name} 輸 ${amt}\n"
+                            game['session_log'].append({'d': p_name, 'c': b_name, 'amt': amt, 'note': '推筒', 'time': timestamp})
+                        else:
+                            output_msg += f"🤝 {p_name} 走水\n"
+
+                    output_msg += "\n🔄 自動開始下一局！(金額照舊，請直接推)"
+                    
+                    # 重置小局 (保留 bets, session_log, banker)
+                    game['played_users'] = []
+                    game['player_results'] = {}
+                    game['banker_card_val'] = None
+                    game['banker_desc'] = ""
+
+                elif game['banker_card_val'] is None:
+                    output_msg += "(等待莊家開牌...)"
+                else:
+                    remaining = len(game['bets']) - len(game['player_results'])
+                    output_msg += f"(還有 {remaining} 位閒家未開...)"
+
+                reply_messages.append(TextSendMessage(text=output_msg))
+
+    # --- 記帳區 ---
     elif text.startswith('!記 '):
         try:
             parts = text.split()
@@ -278,7 +388,7 @@ def handle_text_message(event):
         room['debt'].clear()
         reply_messages.append(TextSendMessage(text="🧹 [本群] 帳本已清空！"))
 
-    # --- 功能: 抓收回 (!抓) ---
+    # --- 工具區 ---
     elif text == '!抓':
         if not room.get('unsent_buffer'):
             reply_messages.append(TextSendMessage(text="👻 目前沒有人收回訊息喔！"))
@@ -288,16 +398,12 @@ def handle_text_message(event):
                 msg_type = item['type']
                 content = item['content']
                 if msg_type == 'text':
-                    reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！剛剛「{sender}」收回了：\n{content}"))
+                    reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！「{sender}」收回：\n{content}"))
                 elif msg_type == 'image':
                     img_url = content
-                    reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！「{sender}」剛剛收回這張圖 👇"))
+                    reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！「{sender}」收回圖片 👇"))
                     reply_messages.append(ImageSendMessage(original_content_url=img_url, preview_image_url=img_url))
             room['unsent_buffer'] = []
-
-    # --- 其他工具 ---
-    elif text == '!骰子':
-        reply_messages.append(TextSendMessage(text=f"🎲 擲出了：{random.randint(1, 6)} 點"))
 
     elif text == '!金價':
         try:
@@ -342,8 +448,7 @@ def handle_text_message(event):
         try:
             w = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=auto", headers=headers).json()
             reply_messages.append(TextSendMessage(text=f"🌤 {loc} 目前氣溫：{w['current_weather']['temperature']}°C"))
-        except:
-            reply_messages.append(TextSendMessage(text="⚠️ 氣象資料失敗。"))
+        except: pass
 
     if reply_messages:
         line_bot_api.reply_message(event.reply_token, reply_messages)
@@ -356,6 +461,7 @@ def handle_image(event):
     with open(os.path.join(static_tmp_path, f"{msg_id}.jpg"), 'wb') as fd:
         for chunk in content.iter_content(): fd.write(chunk)
 
+# --- 處理收回 (被動) ---
 @handler.add(UnsendEvent)
 def handle_unsend(event):
     uid = event.unsend.message_id
