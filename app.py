@@ -22,10 +22,10 @@ app = Flask(__name__)
 FQDN = "https://line-bot-unsend.onrender.com"
 
 # 👇 2. 請填入「你的」User ID (最高權限老闆)
-OWNER_ID = "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" 
+OWNER_ID = "U6d111042c6ecb593b8c6bb781417c45f" 
 
 # 👇 3. 電腦連線密碼
-API_PASSWORD = "123456"
+API_PASSWORD = "0208"
 # ==========================================
 
 token = os.environ.get('CHANNEL_ACCESS_TOKEN')
