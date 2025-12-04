@@ -18,11 +18,10 @@ from googletrans import Translator
 app = Flask(__name__)
 
 # ==========================================
-# 👇 1. 請改成你的 Render 網址 (開頭 https, 後面不要有 /)
+# 👇 1. 請改成你的 Render 網址
 FQDN = "https://line-bot-unsend.onrender.com"
 
-# 👇 2. 請填入「你的」User ID (最高權限老闆)
-# (如果不知道，部署後對機器人輸入 !id 查詢)
+# 👇 2. 請填入「你的」User ID (最高權限老闆，用 !id 查)
 OWNER_ID = "U6d111042c6ecb593b8c6bb781417c45f" 
 # ==========================================
 
@@ -38,10 +37,9 @@ static_tmp_path = os.path.join(os.path.dirname(__file__), 'static', 'tmp')
 os.makedirs(static_tmp_path, exist_ok=True)
 rooms_data = {}
 
-# --- 權限與黑名單 ---
-ADMINS = {OWNER_ID} 
-AUTHORIZED_GROUPS = set()
-BLACKLIST = set()
+# 全域設定
+ADMINS = {OWNER_ID}
+BLACKLIST = set() # 黑名單
 
 def get_room_data(source_id):
     if source_id not in rooms_data:
@@ -122,89 +120,59 @@ def get_user_name(event, user_id=None):
         else: return line_bot_api.get_profile(user_id).display_name
     except: return "玩家"
 
-# --- 自動退群倒數 ---
-def check_auth_and_leave(group_id):
-    time.sleep(20)
-    if group_id not in AUTHORIZED_GROUPS:
-        try:
-            line_bot_api.push_message(group_id, TextSendMessage(text="⏳ 驗證超時！請付費購買授權。\n👋 機器人自動退出..."))
-            line_bot_api.leave_group(group_id)
-        except: pass
-
-# --- 賭局計時器 ---
+# --- 倒數計時器 ---
 def round_timer_thread(group_id, check_round_id):
     time.sleep(15)
     room = get_room_data(group_id); game = room['game']
     if game['round_id'] != check_round_id or not game['banker_id'] or game['banker_card_val'] is None: return
-    
     unplayed = [pid for pid in game['bets'] if pid not in game['played_users']]
     if unplayed:
         try: line_bot_api.push_message(group_id, TextSendMessage(text=f"⏰ 還有 {len(unplayed)} 人未開牌！剩 5 秒判輸！"))
         except: pass
     else: return
-
     time.sleep(5)
     if game['round_id'] != check_round_id or not game['banker_id']: return
-    
     missing_text = ""; ts = datetime.now().strftime("%H:%M"); has_penalty = False
     for pid, info in game['bets'].items():
         if pid not in game['played_users']:
             amt = info['amount']; p_name = info['name']
             missing_text += f"💤 {p_name} 超時未開 ❌ 輸 ${amt}\n"
             game['session_log'].append({'winner_id': game['banker_id'], 'winner_name': game['banker_name'], 'loser_id': pid, 'loser_name': p_name, 'amt': amt, 'desc': '超時判輸', 'time': ts})
-            game['played_users'].append(pid)
-            has_penalty = True
-
+            game['played_users'].append(pid); has_penalty = True
     if has_penalty:
         check_and_settle(group_id, room)
         if missing_text:
             try: line_bot_api.push_message(group_id, TextSendMessage(text=f"⌛ 時間到！\n{missing_text}"))
             except: pass
 
-# --- 結算檢查 ---
 def check_and_settle(group_id, room):
     game = room['game']
     all_bets = set(game['bets'].keys())
     if game['banker_card_val'] is not None and all_bets.issubset(set(game['played_users'])):
-        output_msg = "\n⚔️ 本局結算：\n"
-        b_val = game['banker_card_val']; b_name = game['banker_name']; b_mult = 1
+        output_msg = "\n⚔️ 本局結算：\n"; b_val = game['banker_card_val']; b_name = game['banker_name']; b_mult = 1
         if game['game_type'] == 'niu':
             if "牛牛" in game['banker_desc']: b_mult = 3
             elif "牛8" in game['banker_desc'] or "牛9" in game['banker_desc']: b_mult = 2
         ts = datetime.now().strftime("%H:%M")
-
         for pid in game['bets']:
-            if pid not in game['player_results']: continue
+            if pid not in game['player_results']: continue 
             p_res = game['player_results'][pid]; p_val = p_res['val']; p_name = p_res['name']; p_mult = p_res['mult']; base_amt = game['bets'][pid]['amount']
-            
             if p_val > b_val:
-                final_amt = base_amt * p_mult
-                output_msg += f"✅ {p_name} 贏 ${final_amt}\n"
+                final_amt = base_amt * p_mult; output_msg += f"✅ {p_name} 贏 ${final_amt}\n"
                 game['session_log'].append({'winner_id': pid, 'winner_name': p_name, 'loser_id': game['banker_id'], 'loser_name': b_name, 'amt': final_amt, 'desc': '閒贏', 'time': ts})
             elif p_val < b_val:
-                final_amt = base_amt * b_mult
-                output_msg += f"❌ {p_name} 輸 ${final_amt}\n"
+                final_amt = base_amt * b_mult; output_msg += f"❌ {p_name} 輸 ${final_amt}\n"
                 game['session_log'].append({'winner_id': game['banker_id'], 'winner_name': b_name, 'loser_id': pid, 'loser_name': p_name, 'amt': final_amt, 'desc': '莊贏', 'time': ts})
             else: output_msg += f"🤝 {p_name} 走水\n"
-
         output_msg += f"\n🔄 自動開始下一局！ (剩 {len(room['deck'])} 張)"
         if not game['session_locked']:
             game['session_locked'] = True; game['allowed_players'] = set(game['bets'].keys())
             output_msg += "\n🔒 玩家名單已鎖定！"
-
         game['played_users'] = []; game['player_results'] = {}; game['banker_card_val'] = None; game['banker_desc'] = ""; game['round_id'] += 1
         try: line_bot_api.push_message(group_id, TextSendMessage(text=output_msg))
         except: pass
 
-@handler.add(JoinEvent)
-def handle_join(event):
-    gid = event.source.group_id
-    if gid in AUTHORIZED_GROUPS:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="✅ 授權成功！機器人已啟動。"))
-    else:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 【未授權警告】\n此群組尚未開通。\n請管理員在 20 秒內輸入「!開通」\n否則機器人將自動退出！"))
-        threading.Thread(target=check_auth_and_leave, args=(gid,), daemon=True).start()
-
+# --- 訊息處理 ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     msg_id = event.message.id
@@ -212,27 +180,18 @@ def handle_text_message(event):
     user_id = event.source.user_id
     source_id = event.source.group_id if event.source.type == 'group' else event.source.user_id
     
-    # 🚫 黑名單攔截
+    # 🚫 黑名單攔截 (在最前面檢查)
     if user_id in BLACKLIST: return 
 
     room = get_room_data(source_id)
     message_store[msg_id] = text
     reply_messages = []
 
-    # --- 🔒 權限指令 ---
+    # --- 1. 權限指令 (!id) ---
     if text == '!id':
         reply_messages.append(TextSendMessage(text=f"Your ID:\n{user_id}"))
-    elif text == '!開通':
-        if user_id in ADMINS or user_id == OWNER_ID:
-            AUTHORIZED_GROUPS.add(source_id)
-            reply_messages.append(TextSendMessage(text="✅ 授權成功！本群組已開通。"))
-        else: reply_messages.append(TextSendMessage(text="🚫 權限不足！"))
-    elif text.startswith('!新增管理員 '):
-        if user_id == OWNER_ID:
-            new_admin = text.replace('!新增管理員', '').strip()
-            if new_admin: ADMINS.add(new_admin); reply_messages.append(TextSendMessage(text=f"👮‍♂️ 已新增管理員。"))
-    
-    # --- 🚫 黑名單管理 (支援 @標記 和 ID) ---
+
+    # --- 2. 黑名單管理 (新增在這裡) ---
     elif text.startswith('!黑名單'):
         if user_id == OWNER_ID:
             count = 0
@@ -241,8 +200,11 @@ def handle_text_message(event):
                     BLACKLIST.add(mention.user_id); count += 1
                 reply_messages.append(TextSendMessage(text=f"🚫 已封鎖 {count} 人"))
             else:
-                tid = text.replace('!黑名單', '').strip()
-                if tid: BLACKLIST.add(tid); reply_messages.append(TextSendMessage(text=f"🚫 已封鎖 ID: {tid}"))
+                target = text.replace('!黑名單', '').strip()
+                if target: BLACKLIST.add(target); reply_messages.append(TextSendMessage(text=f"🚫 已封鎖 ID: {target}"))
+        else:
+            reply_messages.append(TextSendMessage(text="🚫 權限不足！"))
+
     elif text.startswith('!解黑'):
         if user_id == OWNER_ID:
             count = 0
@@ -251,10 +213,10 @@ def handle_text_message(event):
                     if mention.user_id in BLACKLIST: BLACKLIST.remove(mention.user_id); count += 1
                 reply_messages.append(TextSendMessage(text=f"⭕ 已解鎖 {count} 人"))
             else:
-                tid = text.replace('!解黑', '').strip()
-                if tid in BLACKLIST: BLACKLIST.remove(tid); reply_messages.append(TextSendMessage(text=f"⭕ 已解鎖 ID: {tid}"))
+                target = text.replace('!解黑', '').strip()
+                if target in BLACKLIST: BLACKLIST.remove(target); reply_messages.append(TextSendMessage(text=f"⭕ 已解鎖 ID: {target}"))
 
-    # --- 🇹🇭 翻譯 ---
+    # --- 3. 翻譯 (被動) ---
     elif text.startswith('!泰 '):
         c = text[3:].strip()
         if c:
@@ -268,18 +230,25 @@ def handle_text_message(event):
                 if res.text != text: reply_messages.append(TextSendMessage(text=f"🇹🇭 泰翻中：\n{res.text}"))
         except: pass
 
-    # --- 🤖 指令表 ---
-    if text == '!指令':
+    # --- 指令表 ---
+    elif text == '!指令':
         reply_text = (
-            "🤖 機器人指令表：\n-----------------\n🔒 授權\n👉 !id / !開通 (限管)\n👉 !黑名單 @人 (限老闆)\n\n🎰 流水局\n1. !搶莊\n2. !下注 200\n3. !推 (推筒/妞妞)\n4. !停 / !收牌\n5. !下莊 (亂喊罰一萬)\n\n🇹🇭 翻譯\n👉 !泰 [文] / 傳泰文自動翻\n\n💰 記帳\n👉 !記 / !還 / !查帳 / !一筆勾銷\n👉 !抓 (防收回)\n👉 !金價 / !匯率 / !天氣\n-----------------\n㊗️黃燜雞楊梅店,黃金當鋪,JC Beauty生意興榮㊗️"
+            "🤖 機器人指令表：\n-----------------\n"
+            "🔒 管理\n👉 !id (查ID)\n👉 !黑名單 @人 (老闆限)\n\n"
+            "🎰 流水局\n1. !搶莊\n2. !下注 200\n3. !推 (推筒/妞妞)\n4. !停 / !收牌\n5. !下莊 (亂喊罰一萬)\n\n"
+            "🇹🇭 翻譯\n👉 !泰 [文] / 傳泰文自動翻\n\n"
+            "💰 記帳\n👉 !記 / !還 / !查帳 / !一筆勾銷\n👉 !抓 (防收回)\n👉 !金價 / !匯率 / !天氣\n-----------------\n"
+            "㊗️黃燜雞楊梅店,黃金當鋪,JC Beauty生意興榮㊗️"
         )
         reply_messages.append(TextSendMessage(text=reply_text))
 
     # --- 🎰 賭場控制 ---
     elif text == '!搶莊':
-        room['deck'] = []; banker_name = get_user_name(event)
+        new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4; random.shuffle(new_deck)
+        room['deck'] = new_deck; banker_name = get_user_name(event)
         room['game'] = {'banker_id': user_id, 'banker_name': banker_name, 'game_type': None, 'banker_card_val': None, 'banker_desc': "", 'bets': {}, 'player_results': {}, 'session_log': [], 'played_users': [], 'betting_locked': False, 'session_locked': False, 'allowed_players': set(), 'round_id': 0}
-        reply_messages.append(TextSendMessage(text=f"👑 新局開始！莊家：{banker_name}\n❓ 請決定遊戲：輸入「!推」或「!妞妞」"))
+        room['deck'] = [] 
+        reply_messages.append(TextSendMessage(text=f"👑 新局開始！莊家：{banker_name}\n❓ 莊家請決定遊戲：輸入「!推」或「!妞妞」\n👉 閒家請「!下注」"))
 
     elif text == '!下莊':
         game = room['game']; user_name = get_user_name(event)
@@ -289,7 +258,7 @@ def handle_text_message(event):
             game['session_log'].append({'winner_id': game['banker_id'], 'winner_name': game['banker_name'], 'loser_id': user_id, 'loser_name': user_name, 'amt': 10000, 'desc': '亂喊下莊罰款', 'time': ts})
             reply_messages.append(TextSendMessage(text=f"😡 {user_name} 亂喊下莊！罰 $10,000"))
         else:
-            if not game['session_log']: reply_messages.append(TextSendMessage(text="⚠️ 無紀錄"))
+            if not game['session_log']: reply_messages.append(TextSendMessage(text="⚠️ 無輸贏紀錄"))
             else:
                 p_bal = {}; bid = game['banker_id']; bname = game['banker_name']
                 for r in game['session_log']:
@@ -326,7 +295,7 @@ def handle_text_message(event):
             if wc == 1: reply_messages.append(TextSendMessage(text=f"⚠️ {name} 遊戲鎖定，路人勿擾(1次)"))
             elif wc == 2:
                 game['session_log'].append({'winner_id': game['banker_id'], 'winner_name': game['banker_name'], 'loser_id': user_id, 'loser_name': name, 'amt': 200, 'desc': '路人罰款', 'time': datetime.now().strftime("%H:%M")})
-                reply_messages.append(TextSendMessage(text=f"😡 {name} 罰款 $200"))
+                reply_messages.append(TextSendMessage(text=f"😡 {name} 講不聽！罰款 $200"))
             else: reply_messages.append(TextSendMessage(text=f"🤬 死小孩講不聽是不是！"))
         else:
             try:
@@ -342,8 +311,8 @@ def handle_text_message(event):
         else:
             if not game['game_type']:
                 game['game_type'] = cmd
-                if cmd == 'tui': room['deck'] = [1,2,3,4,5,6,7,8,9,0.5]*4; msg="🀄 推筒子！"
-                else: room['deck'] = [(r,s) for s in ['♠','♥','♦','♣'] for r in range(1,14)]; msg="🐂 妞妞！"
+                if cmd == 'tui': room['deck'] = [1,2,3,4,5,6,7,8,9,0.5]*4; msg="🀄 推筒子局！"
+                else: room['deck'] = [(r,s) for s in ['♠','♥','♦','♣'] for r in range(1,14)]; msg="🐂 妞妞局！"
                 random.shuffle(room['deck']); deck = room['deck']; reply_messages.append(TextSendMessage(text=msg))
             elif game['game_type'] != cmd: return
 
@@ -367,11 +336,25 @@ def handle_text_message(event):
                     reply_messages.append(TextSendMessage(text=f"👑 莊家 {name}：\n{game['banker_desc']}\n"))
                     threading.Thread(target=round_timer_thread, args=(source_id, game['round_id']), daemon=True).start()
                 else:
-                    reply_messages.append(TextSendMessage(text=f"👤 {name}：\n{cstr} ({desc})\n"))
-                    game['player_results'][uid] = {'val': val, 'name': name, 'mult': mult}
+                    reply_messages.append(TextSendMessage(text=f"👤 {name}：\n{cstr} ({desc})\n")); game['player_results'][uid] = {'val': val, 'name': name, 'mult': mult}
                 check_and_settle(source_id, room)
 
-    # --- 記帳/工具 ---
+    elif text == '!收牌':
+        game = room['game']; deck = room['deck']
+        if not game['banker_id']: return
+        ts = datetime.now().strftime("%H:%M"); msg = ""
+        for pid, info in game['bets'].items():
+            if pid not in game['played_users']:
+                game['session_log'].append({'winner_id': game['banker_id'], 'winner_name': game['banker_name'], 'loser_id': pid, 'loser_name': info['name'], 'amt': info['amount'], 'desc': '未開牌', 'time': ts})
+                msg += f"💤 {info['name']} 沒開 ❌ 輸 ${info['amount']}\n"
+        req = (len(game['bets'])+1) * (2 if game['game_type']=='tui' else 5); shuf = ""
+        if len(deck) < req:
+            if game['game_type']=='tui': deck = [1,2,3,4,5,6,7,8,9,0.5]*4
+            else: deck = [(r,s) for s in ['♠','♥','♦','♣'] for r in range(1,14)]
+            random.shuffle(deck); room['deck'] = deck; shuf = "\n🀄 自動洗牌！"
+        game['played_users'] = []; game['player_results'] = {}; game['banker_card_val'] = None
+        reply_messages.append(TextSendMessage(text=f"🔄 強制結算！{shuf}\n{msg}👉 下一局開始 (剩 {len(deck)} 張)"))
+
     elif text.startswith('!記 '):
         try:
             p = text.split(); i = p.index('欠'); d, c, a = p[1], p[i+1], int(p[i+2]); n = " ".join(p[i+3:]) if len(p)>i+3 else "無"
@@ -385,7 +368,7 @@ def handle_text_message(event):
             reply_messages.append(TextSendMessage(text=f"💸 已扣除：\n{d} 還 {c} ${a}"))
         except: pass
     elif text == '!查帳':
-        if not room['debt']: reply_messages.append(TextSendMessage(text="📭 無欠款"))
+        if not room['debt']: reply_messages.append(TextSendMessage(text="📭 無欠款紀錄"))
         else:
             s = {}; res = "📊 【欠款總結】\n"
             for r in room['debt']: k=(r['d'],r['c']); s[k]=s.get(k,0)+r['amt']
