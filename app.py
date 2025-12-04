@@ -6,7 +6,7 @@ import time
 import traceback
 from datetime import datetime
 from bs4 import BeautifulSoup
-from flask import Flask, request, abort
+from flask import Flask, request, abort, jsonify
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
@@ -21,11 +21,13 @@ app = Flask(__name__)
 # 👇 1. 請改成你的 Render 網址
 FQDN = "https://line-bot-unsend.onrender.com"
 
-# 👇 2. 請填入「你的」User ID (最高權限老闆，用 !id 查)
+# 👇 2. 請填入「你的」User ID
 OWNER_ID = "U6d111042c6ecb593b8c6bb781417c45f" 
+
+# 👇 3. 電腦控制台的連線密碼
+API_PASSWORD = "0208"
 # ==========================================
 
-# 設定金鑰
 token = os.environ.get('CHANNEL_ACCESS_TOKEN')
 secret = os.environ.get('CHANNEL_SECRET')
 line_bot_api = LineBotApi(token)
@@ -37,9 +39,9 @@ static_tmp_path = os.path.join(os.path.dirname(__file__), 'static', 'tmp')
 os.makedirs(static_tmp_path, exist_ok=True)
 rooms_data = {}
 
-# 全域設定
+# 管理員與黑名單
 ADMINS = {OWNER_ID}
-BLACKLIST = set() # 黑名單
+BLACKLIST = set()
 
 def get_room_data(source_id):
     if source_id not in rooms_data:
@@ -73,7 +75,52 @@ threading.Thread(target=cleanup_images, daemon=True).start()
 @app.route("/")
 def home(): return "Robot is Alive!"
 
-headers = {"User-Agent": "Mozilla/5.0"}
+# --- 🔌 電腦遙控專用接口 ---
+@app.route("/api/control", methods=['POST'])
+def api_control():
+    data = request.json
+    pwd = data.get('password')
+    cmd = data.get('command')
+    payload = data.get('payload', {})
+
+    if pwd != API_PASSWORD:
+        return jsonify({"status": "error", "message": "密碼錯誤"}), 403
+
+    if cmd == "status":
+        return jsonify({
+            "status": "ok",
+            "active_groups": len(rooms_data),
+            "blacklist_count": len(BLACKLIST)
+        })
+
+    elif cmd == "broadcast":
+        msg = payload.get('message', '')
+        count = 0
+        if msg:
+            for gid in rooms_data:
+                try:
+                    line_bot_api.push_message(gid, TextSendMessage(text=f"📢 [系統公告] {msg}"))
+                    count += 1
+                except: pass
+        return jsonify({"status": "ok", "message": f"已發送給 {count} 個群組"})
+
+    elif cmd == "reset_all":
+        # 強制重置所有群組的賭局
+        for gid in rooms_data:
+            get_room_data(gid) # 確保初始化
+            new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4
+            random.shuffle(new_deck)
+            rooms_data[gid]['deck'] = new_deck
+            rooms_data[gid]['game'] = {
+                'banker_id': None, 'banker_name': None, 'game_type': None,
+                'banker_card_val': None, 'banker_desc': "", 'bets': {},
+                'player_results': {}, 'session_log': [], 'played_users': [],
+                'betting_locked': False, 'session_locked': False, 'allowed_players': set(),
+                'round_id': rooms_data[gid]['game'].get('round_id', 0) + 1
+            }
+        return jsonify({"status": "ok", "message": "所有群組賭局已強制重置"})
+
+    return jsonify({"status": "error", "message": "未知指令"})
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -84,7 +131,7 @@ def callback():
     except Exception as e: print(f"Error: {e}"); return 'OK'
     return 'OK'
 
-# --- 遊戲邏輯 ---
+# --- 遊戲/翻譯/工具/防收回 邏輯 (保持不變) ---
 def get_tile_text(v):
     tiles_map = {1:"🀙",2:"🀚",3:"🀛",4:"🀜",5:"🀝",6:"🀞",7:"🀟",8:"🀠",9:"🀡",0.5:"🀆"}
     return tiles_map.get(v, "🀫")
@@ -120,7 +167,7 @@ def get_user_name(event, user_id=None):
         else: return line_bot_api.get_profile(user_id).display_name
     except: return "玩家"
 
-# --- 倒數計時器 ---
+# 計時器
 def round_timer_thread(group_id, check_round_id):
     time.sleep(15)
     room = get_room_data(group_id); game = room['game']
@@ -172,83 +219,54 @@ def check_and_settle(group_id, room):
         try: line_bot_api.push_message(group_id, TextSendMessage(text=output_msg))
         except: pass
 
-# --- 訊息處理 ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
-    msg_id = event.message.id
-    text = event.message.text.strip()
+    msg_id = event.message.id; text = event.message.text.strip()
     user_id = event.source.user_id
     source_id = event.source.group_id if event.source.type == 'group' else event.source.user_id
-    
-    # 🚫 黑名單攔截 (在最前面檢查)
     if user_id in BLACKLIST: return 
-
     room = get_room_data(source_id)
     message_store[msg_id] = text
     reply_messages = []
 
-    # --- 1. 權限指令 (!id) ---
-    if text == '!id':
-        reply_messages.append(TextSendMessage(text=f"Your ID:\n{user_id}"))
-
-    # --- 2. 黑名單管理 (新增在這裡) ---
-    elif text.startswith('!黑名單'):
-        if user_id == OWNER_ID:
-            count = 0
+    if text == '!id': reply_messages.append(TextSendMessage(text=f"ID: {user_id}"))
+    elif text.startswith('!黑名單 '):
+        if user_id in ADMINS:
             if event.message.mention:
-                for mention in event.message.mention.mentionees:
-                    BLACKLIST.add(mention.user_id); count += 1
-                reply_messages.append(TextSendMessage(text=f"🚫 已封鎖 {count} 人"))
-            else:
-                target = text.replace('!黑名單', '').strip()
-                if target: BLACKLIST.add(target); reply_messages.append(TextSendMessage(text=f"🚫 已封鎖 ID: {target}"))
-        else:
-            reply_messages.append(TextSendMessage(text="🚫 權限不足！"))
-
+                for m in event.message.mention.mentionees: BLACKLIST.add(m.user_id)
+                reply_messages.append(TextSendMessage(text="🚫 已封鎖標記對象"))
+            elif text.replace('!黑名單', '').strip():
+                BLACKLIST.add(text.replace('!黑名單', '').strip())
+                reply_messages.append(TextSendMessage(text="🚫 ID 已封鎖"))
     elif text.startswith('!解黑'):
-        if user_id == OWNER_ID:
-            count = 0
+        if user_id in ADMINS:
+            target = text.replace('!解黑', '').strip()
             if event.message.mention:
-                for mention in event.message.mention.mentionees:
-                    if mention.user_id in BLACKLIST: BLACKLIST.remove(mention.user_id); count += 1
-                reply_messages.append(TextSendMessage(text=f"⭕ 已解鎖 {count} 人"))
-            else:
-                target = text.replace('!解黑', '').strip()
-                if target in BLACKLIST: BLACKLIST.remove(target); reply_messages.append(TextSendMessage(text=f"⭕ 已解鎖 ID: {target}"))
+                for m in event.message.mention.mentionees: 
+                    if m.user_id in BLACKLIST: BLACKLIST.remove(m.user_id)
+                reply_messages.append(TextSendMessage(text="⭕ 已解鎖"))
+            elif target in BLACKLIST: BLACKLIST.remove(target); reply_messages.append(TextSendMessage(text="⭕ ID 已解鎖"))
 
-    # --- 3. 翻譯 (被動) ---
     elif text.startswith('!泰 '):
-        c = text[3:].strip()
-        if c:
-            try: reply_messages.append(TextSendMessage(text=f"🇹🇭 泰文：\n{translator.translate(c, dest='th').text}"))
-            except: reply_messages.append(TextSendMessage(text="⚠️ 翻譯失敗"))
+        try: reply_messages.append(TextSendMessage(text=f"🇹🇭 泰文：\n{translator.translate(text[3:].strip(), dest='th').text}"))
+        except: pass
     elif not text.startswith('!'):
         try:
-            detected = translator.detect(text)
-            if detected.lang == 'th':
-                res = translator.translate(text, src='th', dest='zh-tw')
-                if res.text != text: reply_messages.append(TextSendMessage(text=f"🇹🇭 泰翻中：\n{res.text}"))
+            d = translator.detect(text)
+            if d.lang == 'th' and d.confidence > 0.8:
+                r = translator.translate(text, src='th', dest='zh-tw')
+                if r.text != text: reply_messages.append(TextSendMessage(text=f"🇹🇭 泰翻中：\n{r.text}"))
         except: pass
 
-    # --- 指令表 ---
     elif text == '!指令':
-        reply_text = (
-            "🤖 機器人指令表：\n-----------------\n"
-            "🔒 管理\n👉 !id (查ID)\n👉 !黑名單 @人 (老闆限)\n\n"
-            "🎰 流水局\n1. !搶莊\n2. !下注 200\n3. !推 (推筒/妞妞)\n4. !停 / !收牌\n5. !下莊 (亂喊罰一萬)\n\n"
-            "🇹🇭 翻譯\n👉 !泰 [文] / 傳泰文自動翻\n\n"
-            "💰 記帳\n👉 !記 / !還 / !查帳 / !一筆勾銷\n👉 !抓 (防收回)\n👉 !金價 / !匯率 / !天氣\n-----------------\n"
-            "㊗️黃燜雞楊梅店,黃金當鋪,JC Beauty生意興榮㊗️"
-        )
-        reply_messages.append(TextSendMessage(text=reply_text))
+        reply_messages.append(TextSendMessage(text="🤖 指令表：\n-----------------\n🎰 賭場\n!搶莊 / !下注 / !推\n!停 / !收牌 / !下莊\n\n💰 記帳\n!記 / !還 / !查帳 / !一筆勾銷\n\n🇹🇭 !泰 / !抓 / !金價 / !匯率 / !天氣\n-----------------\n㊗️黃燜雞楊梅店,黃金當鋪,JC Beauty生意興榮㊗️"))
 
-    # --- 🎰 賭場控制 ---
     elif text == '!搶莊':
         new_deck = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0.5] * 4; random.shuffle(new_deck)
         room['deck'] = new_deck; banker_name = get_user_name(event)
         room['game'] = {'banker_id': user_id, 'banker_name': banker_name, 'game_type': None, 'banker_card_val': None, 'banker_desc': "", 'bets': {}, 'player_results': {}, 'session_log': [], 'played_users': [], 'betting_locked': False, 'session_locked': False, 'allowed_players': set(), 'round_id': 0}
         room['deck'] = [] 
-        reply_messages.append(TextSendMessage(text=f"👑 新局開始！莊家：{banker_name}\n❓ 莊家請決定遊戲：輸入「!推」或「!妞妞」\n👉 閒家請「!下注」"))
+        reply_messages.append(TextSendMessage(text=f"👑 新局開始！莊家：{banker_name}\n❓ 請決定：!推 或 !妞妞\n👉 閒家請 !下注"))
 
     elif text == '!下莊':
         game = room['game']; user_name = get_user_name(event)
@@ -258,7 +276,7 @@ def handle_text_message(event):
             game['session_log'].append({'winner_id': game['banker_id'], 'winner_name': game['banker_name'], 'loser_id': user_id, 'loser_name': user_name, 'amt': 10000, 'desc': '亂喊下莊罰款', 'time': ts})
             reply_messages.append(TextSendMessage(text=f"😡 {user_name} 亂喊下莊！罰 $10,000"))
         else:
-            if not game['session_log']: reply_messages.append(TextSendMessage(text="⚠️ 無輸贏紀錄"))
+            if not game['session_log']: reply_messages.append(TextSendMessage(text="⚠️ 無紀錄"))
             else:
                 p_bal = {}; bid = game['banker_id']; bname = game['banker_name']
                 for r in game['session_log']:
@@ -311,8 +329,8 @@ def handle_text_message(event):
         else:
             if not game['game_type']:
                 game['game_type'] = cmd
-                if cmd == 'tui': room['deck'] = [1,2,3,4,5,6,7,8,9,0.5]*4; msg="🀄 推筒子局！"
-                else: room['deck'] = [(r,s) for s in ['♠','♥','♦','♣'] for r in range(1,14)]; msg="🐂 妞妞局！"
+                if cmd == 'tui': room['deck'] = [1,2,3,4,5,6,7,8,9,0.5]*4; msg="🀄 推筒子！"
+                else: room['deck'] = [(r,s) for s in ['♠','♥','♦','♣'] for r in range(1,14)]; msg="🐂 妞妞！"
                 random.shuffle(room['deck']); deck = room['deck']; reply_messages.append(TextSendMessage(text=msg))
             elif game['game_type'] != cmd: return
 
@@ -427,8 +445,7 @@ def handle_text_message(event):
 # --- 處理圖片/收回 ---
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
-    msg_id = event.message.id
-    content = line_bot_api.get_message_content(msg_id)
+    msg_id = event.message.id; content = line_bot_api.get_message_content(msg_id)
     with open(os.path.join(static_tmp_path, f"{msg_id}.jpg"), 'wb') as fd:
         for chunk in content.iter_content(): fd.write(chunk)
 
@@ -443,16 +460,10 @@ def handle_unsend(event):
         if event.source.type == 'group': sender_name = line_bot_api.get_group_member_profile(event.source.group_id, user_id).display_name
         else: sender_name = line_bot_api.get_profile(user_id).display_name
     except: pass
-
-    img_path = os.path.join(static_tmp_path, f"{uid}.jpg")
+    img = os.path.join(static_tmp_path, f"{uid}.jpg")
     if 'unsent_buffer' not in room: room['unsent_buffer'] = []
-
-    if os.path.exists(img_path):
-        url = f"{FQDN}/static/tmp/{uid}.jpg"
-        room['unsent_buffer'].append({'sender': sender_name, 'type': 'image', 'content': url})
-    elif uid in message_store:
-        msg = message_store[uid]
-        room['unsent_buffer'].append({'sender': sender_name, 'type': 'text', 'content': msg})
+    if os.path.exists(img): room['unsent_buffer'].append({'sender':sender, 'type':'image', 'content':f"{FQDN}/static/tmp/{uid}.jpg"})
+    elif uid in message_store: room['unsent_buffer'].append({'sender':sender, 'type':'text', 'content':message_store[uid]})
 
 if __name__ == "__main__":
     app.run()
