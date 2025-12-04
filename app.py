@@ -18,7 +18,7 @@ from googletrans import Translator
 app = Flask(__name__)
 
 # ==========================================
-# 👇 請改成你的 Render 網址
+# 👇 請改成你的 Render 網址 (開頭 https, 後面不要有 /)
 FQDN = "https://line-bot-unsend.onrender.com"
 # ==========================================
 
@@ -28,7 +28,7 @@ secret = os.environ.get('CHANNEL_SECRET')
 line_bot_api = LineBotApi(token)
 handler = WebhookHandler(secret)
 
-# 初始化翻譯
+# 初始化翻譯器
 translator = Translator()
 
 # 資料儲存
@@ -86,8 +86,11 @@ def callback():
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
-    except InvalidSignatureError: abort(400)
-    except Exception as e: print(e); return 'OK'
+    except InvalidSignatureError:
+        abort(400)
+    except Exception as e:
+        print(f"Error: {e}")
+        return 'OK'
     return 'OK'
 
 # --- 遊戲邏輯 ---
@@ -111,7 +114,10 @@ def get_poker_text(card):
     return f"{suit}{r_text}"
 
 def calc_niu_score(hand):
-    values = [10 if r >= 10 else r for r, s in hand]
+    values = []
+    for r, s in hand:
+        v = 10 if r >= 10 else r
+        values.append(v)
     total = sum(values)
     niu_point = -1 
     for i in range(5):
@@ -154,24 +160,27 @@ def handle_text_message(event):
         content = text[3:].strip()
         if content:
             try:
-                # 翻譯成泰文 (th)
                 translated = translator.translate(content, dest='th').text
                 reply_messages.append(TextSendMessage(text=f"🇹🇭 泰文：\n{translated}"))
             except:
                 reply_messages.append(TextSendMessage(text="⚠️ 翻譯失敗。"))
 
-    # --- 2. 被動：泰翻中 (自動偵測) ---
+    # --- 2. 被動：泰翻中 (強力版) ---
     elif not text.startswith('!'):
         try:
-            detected = translator.detect(text)
-            # 如果是泰文且信心度高
-            if detected.lang == 'th' and detected.confidence > 0.8:
-                result = translator.translate(text, src='th', dest='zh-tw')
-                reply_messages.append(TextSendMessage(text=f"🇹🇭 泰翻中：\n{result.text}"))
-        except: pass
+            # 直接翻譯成中文，不先做 detect (因為 detect 有時候會失敗)
+            trans = translator.translate(text, dest='zh-tw')
+            
+            # 如果 Google 判斷來源是泰文 (th) 且 翻譯結果跟原文不一樣(代表有翻成功)
+            if trans.src == 'th' and trans.text != text:
+                reply_messages.append(TextSendMessage(text=f"🇹🇭 泰翻中：\n{trans.text}"))
+        except Exception as e:
+            # 翻譯失敗時安靜跳過，不影響其他功能
+            print(f"Translate Debug: {e}")
+            pass
 
     # --- 3. 指令表 ---
-    elif text == '!指令':
+    if text == '!指令':
         reply_text = (
             "🤖 機器人指令表：\n"
             "-----------------\n"
@@ -381,7 +390,7 @@ def handle_text_message(event):
                 else: output_msg += f"(還有 {len(game['bets']) - len(game['player_results'])} 人...)"
                 reply_messages.append(TextSendMessage(text=output_msg))
 
-    # --- 記帳/工具/天氣 ---
+    # --- 記帳/工具 ---
     elif text.startswith('!記 '):
         try:
             parts = text.split(); idx = parts.index('欠')
@@ -390,14 +399,9 @@ def handle_text_message(event):
             room['debt'].append({'d': d, 'c': c, 'amt': amt, 'note': note, 'time': datetime.now().strftime("%H:%M")})
             reply_messages.append(TextSendMessage(text=f"📝 [本群] 已記錄：\n{d} 欠 {c} ${amt}\n({note})"))
         except: pass
-    elif text.startswith('!還 '):
-        try:
-            parts = text.split(); d, c, amt = parts[1], parts[3], int(parts[4])
-            room['debt'].append({'d': d, 'c': c, 'amt': -amt, 'note': '還款', 'time': datetime.now().strftime("%H:%M")})
-            reply_messages.append(TextSendMessage(text=f"💸 [本群] 已扣除：\n{d} 還 {c} ${amt}"))
-        except: pass
     elif text == '!查帳':
-        if not room['debt']: reply_messages.append(TextSendMessage(text="📭 [本群] 目前沒有欠款紀錄！"))
+        if not room['debt']:
+            reply_messages.append(TextSendMessage(text="📭 [本群] 目前沒有欠款紀錄！"))
         else:
             summary = {}; res = "📊 【本群欠款總結】\n"
             for r in room['debt']:
@@ -413,6 +417,17 @@ def handle_text_message(event):
             reply_messages.append(TextSendMessage(text=res))
     elif text == '!一筆勾銷':
         room['debt'].clear(); reply_messages.append(TextSendMessage(text="🧹 [本群] 帳本已清空！"))
+    elif text == '!抓': # 抓收回
+        if not room.get('unsent_buffer'): reply_messages.append(TextSendMessage(text="👻 目前沒有人收回訊息喔！"))
+        else:
+            for item in room['unsent_buffer']:
+                sender = item['sender']; msg_type = item['type']; content = item['content']
+                if msg_type == 'text': reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！「{sender}」收回：\n{content}"))
+                elif msg_type == 'image':
+                    img_url = content
+                    reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！「{sender}」收回圖片 👇"))
+                    reply_messages.append(ImageSendMessage(original_content_url=img_url, preview_image_url=img_url))
+            room['unsent_buffer'] = []
     elif text == '!金價':
         try:
             res = requests.get("https://999k.com.tw/", headers=headers, timeout=10); res.encoding = 'utf-8'
@@ -447,17 +462,6 @@ def handle_text_message(event):
             w = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=auto", headers=headers).json()
             reply_messages.append(TextSendMessage(text=f"🌤 {loc} 目前氣溫：{w['current_weather']['temperature']}°C"))
         except: pass
-    elif text == '!抓':
-        if not room.get('unsent_buffer'): reply_messages.append(TextSendMessage(text="👻 目前沒有人收回訊息喔！"))
-        else:
-            for item in room['unsent_buffer']:
-                sender = item['sender']; msg_type = item['type']; content = item['content']
-                if msg_type == 'text': reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！「{sender}」收回：\n{content}"))
-                elif msg_type == 'image':
-                    img_url = content
-                    reply_messages.append(TextSendMessage(text=f"🕵️ 抓到了！「{sender}」收回圖片 👇"))
-                    reply_messages.append(ImageSendMessage(original_content_url=img_url, preview_image_url=img_url))
-            room['unsent_buffer'] = []
 
     if reply_messages:
         line_bot_api.reply_message(event.reply_token, reply_messages)
