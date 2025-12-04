@@ -23,7 +23,7 @@ FQDN = "https://line-bot-unsend.onrender.com"
 
 # 👇 2. 請填入「你的」User ID (最高權限)
 # (如果不確定，部署後對機器人輸入 !id 查詢)
-OWNER_ID = "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" 
+OWNER_ID = "U6d111042c6ecb593b8c6bb781417c45f"
 # ==========================================
 
 # 設定金鑰
